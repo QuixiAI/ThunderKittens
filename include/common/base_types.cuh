@@ -334,33 +334,33 @@ template<> struct packing<bool_2> {
 };
 template<> struct packing<char> {
     static __device__ inline constexpr int num() { return 1; }
-    using unpacked_type = char;
-    using packed_type = char2;
-    static __device__ inline constexpr char2 pack(const char &i) { return char2{i, i}; } // this replication makes code cleaner later.
+    using unpacked_type = char; // for compatibility
+    using packed_type = int8_2;
+    static __device__ inline constexpr int8_2 pack(const char &i) { return int8_2{i, i}; } // this replication makes code cleaner later.
 };
-template<> struct packing<signed char> {
+template<> struct packing<int8> {
     static __device__ inline constexpr int num() { return 1; }
-    using unpacked_type = char;
-    using packed_type = char2;
-    static __device__ inline constexpr char2 pack(const signed char &i) { return char2{i, i}; } // this replication makes code cleaner later.
+    using unpacked_type = int8;
+    using packed_type = int8_2;
+    static __device__ inline constexpr int8_2 pack(const int8 &i) { return int8_2{i, i}; } // this replication makes code cleaner later.
 };
-template<> struct packing<char2> {
+template<> struct packing<int8_2> {
     static __device__ inline constexpr int num() { return 2; }
-    using unpacked_type = char;
-    using packed_type = char2;
-    static __device__ inline constexpr char2 pack(const signed char &i) { return char2{i, i}; } // this replication makes code cleaner later.
+    using unpacked_type = int8;
+    using packed_type = int8_2;
+    static __device__ inline constexpr int8_2 pack(const int8 &i) { return int8_2{i, i}; } // this replication makes code cleaner later.
 };
-template<> struct packing<unsigned char> {
+template<> struct packing<uint8> {
     static __device__ inline constexpr int num() { return 1; }
-    using unpacked_type = unsigned char;
-    using packed_type = uchar2;
-    static __device__ inline constexpr uchar2 pack(const unsigned char &i) { return uchar2{i, i}; } // this replication makes code cleaner later.
+    using unpacked_type = uint8;
+    using packed_type = uint8_2;
+    static __device__ inline constexpr uint8_2 pack(const uint8 &i) { return uint8_2{i, i}; } // this replication makes code cleaner later.
 };
-template<> struct packing<uchar2> {
+template<> struct packing<uint8_2> {
     static __device__ inline constexpr int num() { return 2; }
-    using unpacked_type = unsigned char;
-    using packed_type = uchar2;
-    static __device__ inline constexpr uchar2 pack(const unsigned char &i) { return uchar2{i, i}; } // this replication makes code cleaner later.
+    using unpacked_type = uint8;
+    using packed_type = uint8_2;
+    static __device__ inline constexpr uint8_2 pack(const uint8 &i) { return uint8_2{i, i}; } // this replication makes code cleaner later.
 };
 template<> struct packing<short> {
     static __device__ inline constexpr int num() { return 1; }
