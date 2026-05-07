@@ -17,7 +17,7 @@ namespace tcgen05 {
 template<typename D, typename AB, int M, int N, bool trans_a, bool trans_b, bool neg=false>
 __device__ static inline constexpr uint32_t instruction_descriptor() {
     uint32_t desc = 0;
-    if constexpr (sizeof(AB) == 2) { // kind::f16
+    if constexpr (std::is_same_v<AB, half> || std::is_same_v<AB, bf16>) { // kind::f16
         // either accumulate to float, or the input is half and the output is half
         static_assert(std::is_same_v<D, float> || std::is_same_v<AB, half>);
         desc |= 0b00      << 0;  // sparsity bits unneeded
@@ -36,12 +36,6 @@ __device__ static inline constexpr uint32_t instruction_descriptor() {
         } else if constexpr (std::is_same_v<AB, bf16>) {
             desc |= 0b001 << 7;  // 16-bit A input type as BF16
             desc |= 0b001 << 10; // 16-bit B input type as BF16
-        } else if constexpr (std::is_same_v<AB, fp8e4m3>) {
-            desc |= 0b000 << 7;  // 8-bit A input type as FP8 e4m3
-            desc |= 0b000 << 10; // 8-bit B input type as FP8 e4m3
-        } else if constexpr (std::is_same_v<AB, fp8e5m2>) {
-            desc |= 0b001 << 7;  // 8-bit A input type as FP8 e5m2
-            desc |= 0b001 << 10; // 8-bit B input type as FP8 e5m2
         }
         if constexpr (neg) {
             desc |= 0b1   << 13; // Do negate A matrix
@@ -67,7 +61,43 @@ __device__ static inline constexpr uint32_t instruction_descriptor() {
         desc |= (M >> 4) << 24; // A matrix has dimension M, encoded
         desc |= 0b0      << 29; // reserved
         desc |= 0b00     << 30; // no shift for B-matrix reuse
-    } else if constexpr (sizeof(AB) == 1) { // kind::f8f6f4
+    } else if constexpr (std::is_same_v<AB, int8> || std::is_same_v<AB, uint8>) { // kind::i8
+        static_assert(std::is_same_v<D, int>, "Integer MMA must accumulate to int32.");
+        desc |= 0b00      << 0;  // sparsity bits unneeded
+        desc |= 0b0       << 2;  // dense
+        desc |= 0b1       << 3;  // saturate output
+        desc |= 0b10      << 4;  // D matrix is S32 (only option)
+        desc |= 0b0       << 6;  // reserved
+        if constexpr (std::is_same_v<AB, uint8>) {
+            desc |= 0b000 << 7;  // 8-bit A input type as unsigned
+            desc |= 0b000 << 10; // 8-bit B input type as unsigned
+        } else if constexpr (std::is_same_v<AB, int8>) {
+            desc |= 0b001 << 7;  // 8-bit A input type as signed
+            desc |= 0b001 << 10; // 8-bit B input type as signed
+        } else {
+            static_assert(sizeof(AB) == 999, "Invalid AB type.");
+        }
+        static_assert(!neg, "Negation is not supported for integer matrix multiplies.")
+        desc |= 0b0       << 13; // Don't negate A matrix
+        desc |= 0b0       << 14; // Don't negate B matrix
+        if constexpr (trans_a) {
+            desc |= 0b1   << 15; // Transpose A matrix
+        }
+        else {
+            desc |= 0b0   << 15; // Don't transpose A matrix
+        }
+        if constexpr (trans_b) {
+            desc |= 0b1  << 16; // Transpose B matrix
+        }
+        else {
+            desc |= 0b0  << 16; // Don't transpose B matrix
+        }
+        desc |= (N >> 3) << 17; // B matrix has dimension N, encoded
+        desc |= 0b0      << 23; // reserved
+        desc |= (M >> 4) << 24; // A matrix has dimension M, encoded
+        desc |= 0b0      << 29; // reserved
+        desc |= 0b00     << 30; // no shift for B-matrix reuse
+    } else if constexpr (std::is_same_v<AB, fp8e4m3> || std::is_same_v<AB, fp8e5m2> || std::is_same_v<AB, fp4e2m1_2>) { // kind::f8f6f4
         static_assert(std::is_same_v<D, float> || std::is_same_v<D, half>); // FP8/6/4 has to accumulate to float or half
         desc |= 0b00      << 0;  // sparsity bits unneeded
         desc |= 0b0       << 2;  // dense
@@ -163,7 +193,24 @@ __device__ static inline constexpr uint32_t instruction_descriptor() {
 
 template<typename AB, int acc, int ncta=1>
 __device__ static inline void tt_st(uint32_t d_tt_addr, uint32_t a_tt_addr, uint64_t b_desc, uint32_t idesc) {
-    if constexpr (std::is_same_v<AB, fp8e4m3> || std::is_same_v<AB, fp8e5m2> || std::is_same_v<AB, fp4e2m1_2>) {
+    if constexpr (std::is_same_v<AB, int8> || std::is_same_v<AB, uint8>) {
+        if constexpr (ncta == 1) {
+            asm volatile(
+                "{.reg .pred p;\n" \
+                "setp.eq.u32 p, 1, %4;\n" \
+                "tcgen05.mma.cta_group::1.kind::i8 [%0], [%1], %2, %3, p;}\n"
+            ::  "r"(d_tt_addr), "r"(a_tt_addr), "l"(b_desc), "r"(idesc), "n"(acc)
+            );
+        }
+        else {
+            asm volatile(
+                "{.reg .pred p;\n" \
+                "setp.eq.u32 p, 1, %4;\n" \
+                "tcgen05.mma.cta_group::2.kind::i8 [%0], [%1], %2, %3, p;}\n"
+            ::  "r"(d_tt_addr), "r"(a_tt_addr), "l"(b_desc), "r"(idesc), "n"(acc)
+            );
+        }
+    } else if constexpr (std::is_same_v<AB, fp8e4m3> || std::is_same_v<AB, fp8e5m2> || std::is_same_v<AB, fp4e2m1_2>) {
         if constexpr (ncta == 1) {
             asm volatile(
                 "{.reg .pred p;\n" \
@@ -202,7 +249,24 @@ __device__ static inline void tt_st(uint32_t d_tt_addr, uint32_t a_tt_addr, uint
 
 template<typename AB, int acc, int ncta=1>
 __device__ static inline void st_st(uint32_t d_tt_addr, uint64_t a_desc, uint64_t b_desc, uint32_t idesc) {
-    if constexpr (std::is_same_v<AB, fp8e4m3> || std::is_same_v<AB, fp8e5m2> || std::is_same_v<AB, fp4e2m1_2>) {
+    if constexpr (std::is_same_v<AB, int8> || std::is_same_v<AB, uint8>) {
+        if constexpr (ncta == 1) {
+            asm volatile(
+                "{.reg .pred p;\n" \
+                "setp.eq.u32 p, 1, %4;\n" \
+                "tcgen05.mma.cta_group::1.kind::i8 [%0], %1, %2, %3, p;}\n"
+            ::  "r"(d_tt_addr), "l"(a_desc), "l"(b_desc), "r"(idesc), "n"(acc)
+            );
+        }
+        else {
+            asm volatile(
+                "{.reg .pred p;\n" \
+                "setp.eq.u32 p, 1, %4;\n" \
+                "tcgen05.mma.cta_group::2.kind::i8 [%0], %1, %2, %3, p;}\n"
+            ::  "r"(d_tt_addr), "l"(a_desc), "l"(b_desc), "r"(idesc), "n"(acc)
+            );
+        }
+    } else if constexpr (std::is_same_v<AB, fp8e4m3> || std::is_same_v<AB, fp8e5m2> || std::is_same_v<AB, fp4e2m1_2>) {
         if constexpr (ncta == 1) {
             asm volatile(
                 "{.reg .pred p;\n" \
@@ -360,6 +424,11 @@ __device__ static inline void mma(D &d, const A &a, const B &b) {
             std::is_same_v<T_AB, fp8e4m3> ||
             std::is_same_v<T_AB, fp8e5m2> ||
             std::is_same_v<T_AB, fp4e2m1_2>
+        )) ||
+        // Int output with supported input types
+        (std::is_same_v<T_D, int> && (
+            std::is_same_v<T_AB, int8> ||
+            std::is_same_v<T_AB, uint8>
         )),
         "Currently unsupported type combination for matrix multiply."
     );
@@ -433,6 +502,11 @@ __device__ static inline void mma(D &d, const A &a, const B &b) {
             std::is_same_v<T_AB, fp8e4m3> ||
             std::is_same_v<T_AB, fp8e5m2> ||
             std::is_same_v<T_AB, fp4e2m1_2>
+        )) ||
+        // Int output with supported input types
+        (std::is_same_v<T_D, int> && (
+            std::is_same_v<T_AB, int8> ||
+            std::is_same_v<T_AB, uint8>
         )),
         "Currently unsupported type combination for matrix multiply."
     );
