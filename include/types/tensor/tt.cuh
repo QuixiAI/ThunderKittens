@@ -88,7 +88,7 @@ struct tt {
             if constexpr (std::is_same_v<T, bf16> || std::is_same_v<T, half>) {
                 return addr + (16 * chunk / (4/(uint32_t)sizeof(T)));
             }
-            else if constexpr (std::is_same_v<T, fp8e4m3> || std::is_same_v<T, fp8e5m2>) {
+            else if constexpr (std::is_same_v<T, fp8e4m3> || std::is_same_v<T, fp8e5m2> || std::is_same_v<T, int8> || std::is_same_v<T, uint8>) {
                 return addr + (32 * chunk / (4/(uint32_t)sizeof(T)));
             }
             else {
@@ -103,6 +103,9 @@ struct tt {
 template<int _height, int _width> using tt_bf = tt<bf16, _height, _width>;
 template<int _height, int _width> using tt_hf = tt<half, _height, _width>;
 template<int _height, int _width> using tt_fl = tt<float, _height, _width>;
+template<int _height, int _width> using tt_int8 = tt<int8, _height, _width>;
+template<int _height, int _width> using tt_uint8 = tt<uint8, _height, _width>;
+template<int _height, int _width> using tt_int = tt<int, _height, _width>;
 template<int _height, int _width> using tt_fp8e4m3 = tt<fp8e4m3, _height, _width>;
 template<int _height, int _width> using tt_fp8e5m2 = tt<fp8e5m2, _height, _width>;
 template<int _height, int _width> using tt_fp8e8m0 = tt<fp8e8m0, _height, _width>;
@@ -110,6 +113,9 @@ template<int _height, int _width> using tt_fp4e2m1_2 = tt<fp4e2m1_2, _height, _w
 template<int _width> using half_tt_bf = tt<bf16, MAX_TENSOR_ROWS / 2, _width>;
 template<int _width> using half_tt_hf = tt<half, MAX_TENSOR_ROWS / 2, _width>;
 template<int _width> using half_tt_fl = tt<float, MAX_TENSOR_ROWS / 2, _width>;
+template<int _width> using half_tt_int8 = tt<int8, MAX_TENSOR_ROWS / 2, _width>;
+template<int _width> using half_tt_uint8 = tt<uint8, MAX_TENSOR_ROWS / 2, _width>;
+template<int _width> using half_tt_int = tt<int, MAX_TENSOR_ROWS / 2, _width>;
 template<int _width> using half_tt_fp8e4m3 = tt<fp8e4m3, MAX_TENSOR_ROWS / 2, _width>;
 template<int _width> using half_tt_fp8e5m2 = tt<fp8e5m2, MAX_TENSOR_ROWS / 2, _width>;
 template<int _width> using half_tt_fp8e8m0 = tt<fp8e8m0, MAX_TENSOR_ROWS / 2, _width>;
@@ -117,6 +123,9 @@ template<int _width> using half_tt_fp4e2m1_2 = tt<fp4e2m1_2, MAX_TENSOR_ROWS / 2
 template<int _width> using full_tt_bf = tt<bf16, MAX_TENSOR_ROWS, _width>;
 template<int _width> using full_tt_hf = tt<half, MAX_TENSOR_ROWS, _width>;
 template<int _width> using full_tt_fl = tt<float, MAX_TENSOR_ROWS, _width>;
+template<int _width> using full_tt_int8 = tt<int8, MAX_TENSOR_ROWS, _width>;
+template<int _width> using full_tt_uint8 = tt<uint8, MAX_TENSOR_ROWS, _width>;
+template<int _width> using full_tt_int = tt<int, MAX_TENSOR_ROWS, _width>;
 template<int _width> using full_tt_fp8e4m3 = tt<fp8e4m3, MAX_TENSOR_ROWS, _width>;
 template<int _width> using full_tt_fp8e5m2 = tt<fp8e5m2, MAX_TENSOR_ROWS, _width>;
 template<int _width> using full_tt_fp8e8m0 = tt<fp8e8m0, MAX_TENSOR_ROWS, _width>;
