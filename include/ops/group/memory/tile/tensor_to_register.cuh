@@ -53,82 +53,166 @@ __device__ inline static void load_async(RT &dst, const TM &src) {
             }
         }
         else if constexpr (sizeof(typename TM::dtype) == 4) {
-            #pragma unroll
-            for(int i = 0; i < RT::height; i++) {
-                if constexpr (RT::width%4 == 0) {
-                    #pragma unroll
-                    for(int j = 0; j < RT::width; j+=4) {
-                        U2 data[16];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.16x256b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];\n"
-                            : "=f"(data[0].x), "=f"(data[0].y),
-                            "=f"(data[1].x), "=f"(data[1].y),
-                            "=f"(data[2].x), "=f"(data[2].y),
-                            "=f"(data[3].x), "=f"(data[3].y),
-                            "=f"(data[4].x), "=f"(data[4].y),
-                            "=f"(data[5].x), "=f"(data[5].y),
-                            "=f"(data[6].x), "=f"(data[6].y),
-                            "=f"(data[7].x), "=f"(data[7].y),
-                            "=f"(data[8].x), "=f"(data[8].y),
-                            "=f"(data[9].x), "=f"(data[9].y),
-                            "=f"(data[10].x), "=f"(data[10].y),
-                            "=f"(data[11].x), "=f"(data[11].y),
-                            "=f"(data[12].x), "=f"(data[12].y),
-                            "=f"(data[13].x), "=f"(data[13].y),
-                            "=f"(data[14].x), "=f"(data[14].y),
-                            "=f"(data[15].x), "=f"(data[15].y)
-                            : "r"(src.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U)))
-                        );
+            if constexpr (std::is_same_v<U, int>) {
+                #pragma unroll
+                for(int i = 0; i < RT::height; i++) {
+                    if constexpr (RT::width%4 == 0) {
                         #pragma unroll
-                        for(int k = 0; k < 4; k++) {
-                            dst.tiles[i][j+0].data[k] = base_types::convertor<T2, U2>::convert(data[k]);
-                            dst.tiles[i][j+1].data[k] = base_types::convertor<T2, U2>::convert(data[k+4]);
-                            dst.tiles[i][j+2].data[k] = base_types::convertor<T2, U2>::convert(data[k+8]);
-                            dst.tiles[i][j+3].data[k] = base_types::convertor<T2, U2>::convert(data[k+12]);
+                        for(int j = 0; j < RT::width; j+=4) {
+                            U2 data[16];
+                            asm volatile(
+                                "tcgen05.ld.sync.aligned.16x256b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];\n"
+                                : "=r"(data[0].x), "=r"(data[0].y),
+                                "=r"(data[1].x), "=r"(data[1].y),
+                                "=r"(data[2].x), "=r"(data[2].y),
+                                "=r"(data[3].x), "=r"(data[3].y),
+                                "=r"(data[4].x), "=r"(data[4].y),
+                                "=r"(data[5].x), "=r"(data[5].y),
+                                "=r"(data[6].x), "=r"(data[6].y),
+                                "=r"(data[7].x), "=r"(data[7].y),
+                                "=r"(data[8].x), "=r"(data[8].y),
+                                "=r"(data[9].x), "=r"(data[9].y),
+                                "=r"(data[10].x), "=r"(data[10].y),
+                                "=r"(data[11].x), "=r"(data[11].y),
+                                "=r"(data[12].x), "=r"(data[12].y),
+                                "=r"(data[13].x), "=r"(data[13].y),
+                                "=r"(data[14].x), "=r"(data[14].y),
+                                "=r"(data[15].x), "=r"(data[15].y)
+                                : "r"(src.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U)))
+                            );
+                            #pragma unroll
+                            for(int k = 0; k < 4; k++) {
+                                dst.tiles[i][j+0].data[k] = base_types::convertor<T2, U2>::convert(data[k]);
+                                dst.tiles[i][j+1].data[k] = base_types::convertor<T2, U2>::convert(data[k+4]);
+                                dst.tiles[i][j+2].data[k] = base_types::convertor<T2, U2>::convert(data[k+8]);
+                                dst.tiles[i][j+3].data[k] = base_types::convertor<T2, U2>::convert(data[k+12]);
+                            }
+                        }
+                    }
+                    else if constexpr (RT::width%2 == 0) {
+                        #pragma unroll
+                        for(int j = 0; j < RT::width; j+=2) {
+                            U2 data[8];
+                            asm volatile(
+                                "tcgen05.ld.sync.aligned.16x256b.x4.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];\n"
+                                : "=r"(data[0].x), "=r"(data[0].y),
+                                "=r"(data[1].x), "=r"(data[1].y),
+                                "=r"(data[2].x), "=r"(data[2].y),
+                                "=r"(data[3].x), "=r"(data[3].y),
+                                "=r"(data[4].x), "=r"(data[4].y),
+                                "=r"(data[5].x), "=r"(data[5].y),
+                                "=r"(data[6].x), "=r"(data[6].y),
+                                "=r"(data[7].x), "=r"(data[7].y)
+                                : "r"(src.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U)))
+                            );
+                            #pragma unroll
+                            for(int k = 0; k < 4; k++) {
+                                dst.tiles[i][j+0].data[k] = base_types::convertor<T2, U2>::convert(data[k]);
+                                dst.tiles[i][j+1].data[k] = base_types::convertor<T2, U2>::convert(data[k+4]);
+                            }
+                        }
+                    }
+                    else {
+                        #pragma unroll
+                        for(int j = 0; j < RT::width; j++) {
+                            U2 data[4];
+                            asm volatile(
+                                "tcgen05.ld.sync.aligned.16x256b.x2.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];\n"
+                                : "=r"(data[0].x), "=r"(data[0].y),
+                                "=r"(data[1].x), "=r"(data[1].y),
+                                "=r"(data[2].x), "=r"(data[2].y),
+                                "=r"(data[3].x), "=r"(data[3].y)
+                                : "r"(src.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U)))
+                            );
+                            #pragma unroll
+                            for(int k = 0; k < 4; k++) {
+                                dst.tiles[i][j].data[k] = base_types::convertor<T2, U2>::convert(data[k]);
+                            }
                         }
                     }
                 }
-                else if constexpr (RT::width%2 == 0) {
-                    #pragma unroll
-                    for(int j = 0; j < RT::width; j+=2) {
-                        U2 data[8];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.16x256b.x4.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];\n"
-                            : "=f"(data[0].x), "=f"(data[0].y),
-                            "=f"(data[1].x), "=f"(data[1].y),
-                            "=f"(data[2].x), "=f"(data[2].y),
-                            "=f"(data[3].x), "=f"(data[3].y),
-                            "=f"(data[4].x), "=f"(data[4].y),
-                            "=f"(data[5].x), "=f"(data[5].y),
-                            "=f"(data[6].x), "=f"(data[6].y),
-                            "=f"(data[7].x), "=f"(data[7].y)
-                            : "r"(src.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U)))
-                        );
+            }
+            else if constexpr (std::is_same_v<U, float>) {
+                #pragma unroll
+                for(int i = 0; i < RT::height; i++) {
+                    if constexpr (RT::width%4 == 0) {
                         #pragma unroll
-                        for(int k = 0; k < 4; k++) {
-                            dst.tiles[i][j+0].data[k] = base_types::convertor<T2, U2>::convert(data[k]);
-                            dst.tiles[i][j+1].data[k] = base_types::convertor<T2, U2>::convert(data[k+4]);
+                        for(int j = 0; j < RT::width; j+=4) {
+                            U2 data[16];
+                            asm volatile(
+                                "tcgen05.ld.sync.aligned.16x256b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];\n"
+                                : "=f"(data[0].x), "=f"(data[0].y),
+                                "=f"(data[1].x), "=f"(data[1].y),
+                                "=f"(data[2].x), "=f"(data[2].y),
+                                "=f"(data[3].x), "=f"(data[3].y),
+                                "=f"(data[4].x), "=f"(data[4].y),
+                                "=f"(data[5].x), "=f"(data[5].y),
+                                "=f"(data[6].x), "=f"(data[6].y),
+                                "=f"(data[7].x), "=f"(data[7].y),
+                                "=f"(data[8].x), "=f"(data[8].y),
+                                "=f"(data[9].x), "=f"(data[9].y),
+                                "=f"(data[10].x), "=f"(data[10].y),
+                                "=f"(data[11].x), "=f"(data[11].y),
+                                "=f"(data[12].x), "=f"(data[12].y),
+                                "=f"(data[13].x), "=f"(data[13].y),
+                                "=f"(data[14].x), "=f"(data[14].y),
+                                "=f"(data[15].x), "=f"(data[15].y)
+                                : "r"(src.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U)))
+                            );
+                            #pragma unroll
+                            for(int k = 0; k < 4; k++) {
+                                dst.tiles[i][j+0].data[k] = base_types::convertor<T2, U2>::convert(data[k]);
+                                dst.tiles[i][j+1].data[k] = base_types::convertor<T2, U2>::convert(data[k+4]);
+                                dst.tiles[i][j+2].data[k] = base_types::convertor<T2, U2>::convert(data[k+8]);
+                                dst.tiles[i][j+3].data[k] = base_types::convertor<T2, U2>::convert(data[k+12]);
+                            }
+                        }
+                    }
+                    else if constexpr (RT::width%2 == 0) {
+                        #pragma unroll
+                        for(int j = 0; j < RT::width; j+=2) {
+                            U2 data[8];
+                            asm volatile(
+                                "tcgen05.ld.sync.aligned.16x256b.x4.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];\n"
+                                : "=f"(data[0].x), "=f"(data[0].y),
+                                "=f"(data[1].x), "=f"(data[1].y),
+                                "=f"(data[2].x), "=f"(data[2].y),
+                                "=f"(data[3].x), "=f"(data[3].y),
+                                "=f"(data[4].x), "=f"(data[4].y),
+                                "=f"(data[5].x), "=f"(data[5].y),
+                                "=f"(data[6].x), "=f"(data[6].y),
+                                "=f"(data[7].x), "=f"(data[7].y)
+                                : "r"(src.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U)))
+                            );
+                            #pragma unroll
+                            for(int k = 0; k < 4; k++) {
+                                dst.tiles[i][j+0].data[k] = base_types::convertor<T2, U2>::convert(data[k]);
+                                dst.tiles[i][j+1].data[k] = base_types::convertor<T2, U2>::convert(data[k+4]);
+                            }
+                        }
+                    }
+                    else {
+                        #pragma unroll
+                        for(int j = 0; j < RT::width; j++) {
+                            U2 data[4];
+                            asm volatile(
+                                "tcgen05.ld.sync.aligned.16x256b.x2.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];\n"
+                                : "=f"(data[0].x), "=f"(data[0].y),
+                                "=f"(data[1].x), "=f"(data[1].y),
+                                "=f"(data[2].x), "=f"(data[2].y),
+                                "=f"(data[3].x), "=f"(data[3].y)
+                                : "r"(src.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U)))
+                            );
+                            #pragma unroll
+                            for(int k = 0; k < 4; k++) {
+                                dst.tiles[i][j].data[k] = base_types::convertor<T2, U2>::convert(data[k]);
+                            }
                         }
                     }
                 }
-                else {
-                    #pragma unroll
-                    for(int j = 0; j < RT::width; j++) {
-                        U2 data[4];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.16x256b.x2.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];\n"
-                            : "=f"(data[0].x), "=f"(data[0].y),
-                            "=f"(data[1].x), "=f"(data[1].y),
-                            "=f"(data[2].x), "=f"(data[2].y),
-                            "=f"(data[3].x), "=f"(data[3].y)
-                            : "r"(src.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U)))
-                        );
-                        #pragma unroll
-                        for(int k = 0; k < 4; k++) {
-                            dst.tiles[i][j].data[k] = base_types::convertor<T2, U2>::convert(data[k]);
-                        }
-                    }
-                }
+            }
+            else {
+                static_assert(sizeof(U) == 999, "Unsupported 4-byte tensor memory type.");
             }
         }
     }
@@ -168,7 +252,7 @@ __device__ inline static void store_async(TM &dst, const RT &src) {
         using U = TM::dtype;
         using U2 = base_types::packing<U>::packed_type;
 
-        if constexpr (sizeof(typename TM::dtype) == 2) {
+        if constexpr (sizeof(typename TM::dtype) <= 2) {
             #pragma unroll
             for(int i = 0; i < RT::height; i++) {
                 if constexpr (RT::width%4 == 0) {
@@ -229,82 +313,166 @@ __device__ inline static void store_async(TM &dst, const RT &src) {
             }
         }
         else if constexpr (sizeof(typename TM::dtype) == 4) {
-            #pragma unroll
-            for(int i = 0; i < RT::height; i++) {
-                if constexpr(RT::width%4 == 0) {
-                    #pragma unroll
-                    for(int j = 0; j < RT::width; j+=4) {
-                        U2 data[16];
+            if constexpr (std::is_same_v<U, int>) {
+                #pragma unroll
+                for(int i = 0; i < RT::height; i++) {
+                    if constexpr(RT::width%4 == 0) {
                         #pragma unroll
-                        for(int k = 0; k < 4; k++) {
-                            data[k] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[k]);
-                            data[k+4] = base_types::convertor<U2, T2>::convert(src.tiles[i][j+1].data[k]);
-                            data[k+8] = base_types::convertor<U2, T2>::convert(src.tiles[i][j+2].data[k]);
-                            data[k+12] = base_types::convertor<U2, T2>::convert(src.tiles[i][j+3].data[k]);
+                        for(int j = 0; j < RT::width; j+=4) {
+                            U2 data[16];
+                            #pragma unroll
+                            for(int k = 0; k < 4; k++) {
+                                data[k] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[k]);
+                                data[k+4] = base_types::convertor<U2, T2>::convert(src.tiles[i][j+1].data[k]);
+                                data[k+8] = base_types::convertor<U2, T2>::convert(src.tiles[i][j+2].data[k]);
+                                data[k+12] = base_types::convertor<U2, T2>::convert(src.tiles[i][j+3].data[k]);
+                            }
+                            asm volatile(
+                                "tcgen05.st.sync.aligned.16x256b.x8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};\n"
+                                :: "r"(dst.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U))),
+                                "r"(data[0].x), "r"(data[0].y),
+                                "r"(data[1].x), "r"(data[1].y),
+                                "r"(data[2].x), "r"(data[2].y),
+                                "r"(data[3].x), "r"(data[3].y),
+                                "r"(data[4].x), "r"(data[4].y),
+                                "r"(data[5].x), "r"(data[5].y),
+                                "r"(data[6].x), "r"(data[6].y),
+                                "r"(data[7].x), "r"(data[7].y),
+                                "r"(data[8].x), "r"(data[8].y),
+                                "r"(data[9].x), "r"(data[9].y),
+                                "r"(data[10].x), "r"(data[10].y),
+                                "r"(data[11].x), "r"(data[11].y),
+                                "r"(data[12].x), "r"(data[12].y),
+                                "r"(data[13].x), "r"(data[13].y),
+                                "r"(data[14].x), "r"(data[14].y),
+                                "r"(data[15].x), "r"(data[15].y)
+                            );
                         }
-                        asm volatile(
-                            "tcgen05.st.sync.aligned.16x256b.x8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};\n"
-                            :: "r"(dst.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U))),
-                            "f"(data[0].x), "f"(data[0].y),
-                            "f"(data[1].x), "f"(data[1].y),
-                            "f"(data[2].x), "f"(data[2].y),
-                            "f"(data[3].x), "f"(data[3].y),
-                            "f"(data[4].x), "f"(data[4].y),
-                            "f"(data[5].x), "f"(data[5].y),
-                            "f"(data[6].x), "f"(data[6].y),
-                            "f"(data[7].x), "f"(data[7].y),
-                            "f"(data[8].x), "f"(data[8].y),
-                            "f"(data[9].x), "f"(data[9].y),
-                            "f"(data[10].x), "f"(data[10].y),
-                            "f"(data[11].x), "f"(data[11].y),
-                            "f"(data[12].x), "f"(data[12].y),
-                            "f"(data[13].x), "f"(data[13].y),
-                            "f"(data[14].x), "f"(data[14].y),
-                            "f"(data[15].x), "f"(data[15].y)
-                        );
+                    }
+                    else if constexpr(RT::width%2 == 0) {
+                        #pragma unroll
+                        for(int j = 0; j < RT::width; j+=2) {
+                            U2 data[8];
+                            #pragma unroll
+                            for(int k = 0; k < 4; k++) {
+                                data[k] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[k]);
+                                data[k+4] = base_types::convertor<U2, T2>::convert(src.tiles[i][j+1].data[k]);
+                            }
+                            asm volatile(
+                                "tcgen05.st.sync.aligned.16x256b.x4.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};\n"
+                                :: "r"(dst.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U))),
+                                "r"(data[0].x), "r"(data[0].y),
+                                "r"(data[1].x), "r"(data[1].y),
+                                "r"(data[2].x), "r"(data[2].y),
+                                "r"(data[3].x), "r"(data[3].y),
+                                "r"(data[4].x), "r"(data[4].y),
+                                "r"(data[5].x), "r"(data[5].y),
+                                "r"(data[6].x), "r"(data[6].y),
+                                "r"(data[7].x), "r"(data[7].y)
+                            );
+                        }
+                    }
+                    else {
+                        #pragma unroll
+                        for(int j = 0; j < RT::width; j++) {
+                            U2 data[4];
+                            #pragma unroll
+                            for(int k = 0; k < 4; k++) {
+                                data[k] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[k]);
+                            }
+                            asm volatile(
+                                "tcgen05.st.sync.aligned.16x256b.x2.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};\n"
+                                :: "r"(dst.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U))),
+                                "r"(data[0].x), "r"(data[0].y),
+                                "r"(data[1].x), "r"(data[1].y),
+                                "r"(data[2].x), "r"(data[2].y),
+                                "r"(data[3].x), "r"(data[3].y)
+                            );
+                        }
                     }
                 }
-                else if constexpr(RT::width%2 == 0) {
-                    #pragma unroll
-                    for(int j = 0; j < RT::width; j+=2) {
-                        U2 data[8];
+            }
+            else if constexpr (std::is_same_v<U, float>) {
+                #pragma unroll
+                for(int i = 0; i < RT::height; i++) {
+                    if constexpr(RT::width%4 == 0) {
                         #pragma unroll
-                        for(int k = 0; k < 4; k++) {
-                            data[k] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[k]);
-                            data[k+4] = base_types::convertor<U2, T2>::convert(src.tiles[i][j+1].data[k]);
+                        for(int j = 0; j < RT::width; j+=4) {
+                            U2 data[16];
+                            #pragma unroll
+                            for(int k = 0; k < 4; k++) {
+                                data[k] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[k]);
+                                data[k+4] = base_types::convertor<U2, T2>::convert(src.tiles[i][j+1].data[k]);
+                                data[k+8] = base_types::convertor<U2, T2>::convert(src.tiles[i][j+2].data[k]);
+                                data[k+12] = base_types::convertor<U2, T2>::convert(src.tiles[i][j+3].data[k]);
+                            }
+                            asm volatile(
+                                "tcgen05.st.sync.aligned.16x256b.x8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};\n"
+                                :: "r"(dst.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U))),
+                                "f"(data[0].x), "f"(data[0].y),
+                                "f"(data[1].x), "f"(data[1].y),
+                                "f"(data[2].x), "f"(data[2].y),
+                                "f"(data[3].x), "f"(data[3].y),
+                                "f"(data[4].x), "f"(data[4].y),
+                                "f"(data[5].x), "f"(data[5].y),
+                                "f"(data[6].x), "f"(data[6].y),
+                                "f"(data[7].x), "f"(data[7].y),
+                                "f"(data[8].x), "f"(data[8].y),
+                                "f"(data[9].x), "f"(data[9].y),
+                                "f"(data[10].x), "f"(data[10].y),
+                                "f"(data[11].x), "f"(data[11].y),
+                                "f"(data[12].x), "f"(data[12].y),
+                                "f"(data[13].x), "f"(data[13].y),
+                                "f"(data[14].x), "f"(data[14].y),
+                                "f"(data[15].x), "f"(data[15].y)
+                            );
                         }
-                        asm volatile(
-                            "tcgen05.st.sync.aligned.16x256b.x4.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};\n"
-                            :: "r"(dst.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U))),
-                            "f"(data[0].x), "f"(data[0].y),
-                            "f"(data[1].x), "f"(data[1].y),
-                            "f"(data[2].x), "f"(data[2].y),
-                            "f"(data[3].x), "f"(data[3].y),
-                            "f"(data[4].x), "f"(data[4].y),
-                            "f"(data[5].x), "f"(data[5].y),
-                            "f"(data[6].x), "f"(data[6].y),
-                            "f"(data[7].x), "f"(data[7].y)
-                        );
+                    }
+                    else if constexpr(RT::width%2 == 0) {
+                        #pragma unroll
+                        for(int j = 0; j < RT::width; j+=2) {
+                            U2 data[8];
+                            #pragma unroll
+                            for(int k = 0; k < 4; k++) {
+                                data[k] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[k]);
+                                data[k+4] = base_types::convertor<U2, T2>::convert(src.tiles[i][j+1].data[k]);
+                            }
+                            asm volatile(
+                                "tcgen05.st.sync.aligned.16x256b.x4.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};\n"
+                                :: "r"(dst.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U))),
+                                "f"(data[0].x), "f"(data[0].y),
+                                "f"(data[1].x), "f"(data[1].y),
+                                "f"(data[2].x), "f"(data[2].y),
+                                "f"(data[3].x), "f"(data[3].y),
+                                "f"(data[4].x), "f"(data[4].y),
+                                "f"(data[5].x), "f"(data[5].y),
+                                "f"(data[6].x), "f"(data[6].y),
+                                "f"(data[7].x), "f"(data[7].y)
+                            );
+                        }
+                    }
+                    else {
+                        #pragma unroll
+                        for(int j = 0; j < RT::width; j++) {
+                            U2 data[4];
+                            #pragma unroll
+                            for(int k = 0; k < 4; k++) {
+                                data[k] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[k]);
+                            }
+                            asm volatile(
+                                "tcgen05.st.sync.aligned.16x256b.x2.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};\n"
+                                :: "r"(dst.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U))),
+                                "f"(data[0].x), "f"(data[0].y),
+                                "f"(data[1].x), "f"(data[1].y),
+                                "f"(data[2].x), "f"(data[2].y),
+                                "f"(data[3].x), "f"(data[3].y)
+                            );
+                        }
                     }
                 }
-                else {
-                    #pragma unroll
-                    for(int j = 0; j < RT::width; j++) {
-                        U2 data[4];
-                        #pragma unroll
-                        for(int k = 0; k < 4; k++) {
-                            data[k] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[k]);
-                        }
-                        asm volatile(
-                            "tcgen05.st.sync.aligned.16x256b.x2.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};\n"
-                            :: "r"(dst.addr + ((i * RT::tile_size_row) << 16) + (j * RT::tile_size_col)/(4/(uint32_t)sizeof(U))),
-                            "f"(data[0].x), "f"(data[0].y),
-                            "f"(data[1].x), "f"(data[1].y),
-                            "f"(data[2].x), "f"(data[2].y),
-                            "f"(data[3].x), "f"(data[3].y)
-                        );
-                    }
-                }
+            }
+            else {
+                static_assert(sizeof(U) == 999, "Unsupported 4-byte tensor memory type.");
             }
         }
     }
