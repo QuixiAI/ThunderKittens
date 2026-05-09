@@ -188,6 +188,26 @@ template<> struct move<fp8e5m2_4> {
                      "r"(*(uint32_t*)&src1), "r"(*(uint32_t*)&src2), "r"(*(uint32_t*)&src3), "r"(*(uint32_t*)&src4), "r"(dst));
     }
 };
+template<> struct move<int8_4> {
+    __device__ static inline void ldsm4(int8_4& dst1, int8_4& dst2, int8_4& dst3, int8_4& dst4, uint32_t src) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 {%0, %1, %2, %3}, [%4];\n" :
+                     "=r"(*(uint32_t*)&dst1),  "=r"(*(uint32_t*)&dst2), "=r"(*(uint32_t*)&dst3), "=r"(*(uint32_t*)&dst4) : "r"(src));
+    }
+    __device__ static inline void stsm4(uint32_t dst, int8_4& src1, int8_4& src2, int8_4& src3, int8_4& src4) {
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 [%4], {%0, %1, %2, %3};\n" ::
+                     "r"(*(uint32_t*)&src1), "r"(*(uint32_t*)&src2), "r"(*(uint32_t*)&src3), "r"(*(uint32_t*)&src4), "r"(dst));
+    }
+};
+template<> struct move<uint8_4> {
+    __device__ static inline void ldsm4(uint8_4& dst1, uint8_4& dst2, uint8_4& dst3, uint8_4& dst4, uint32_t src) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 {%0, %1, %2, %3}, [%4];\n" :
+                     "=r"(*(uint32_t*)&dst1),  "=r"(*(uint32_t*)&dst2), "=r"(*(uint32_t*)&dst3), "=r"(*(uint32_t*)&dst4) : "r"(src));
+    }
+    __device__ static inline void stsm4(uint32_t dst, uint8_4& src1, uint8_4& src2, uint8_4& src3, uint8_4& src4) {
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 [%4], {%0, %1, %2, %3};\n" ::
+                     "r"(*(uint32_t*)&src1), "r"(*(uint32_t*)&src2), "r"(*(uint32_t*)&src3), "r"(*(uint32_t*)&src4), "r"(dst));
+    }
+};
 #endif
 
 /* ----------   Constants for Cache policies  ---------- */
