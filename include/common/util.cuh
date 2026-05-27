@@ -129,6 +129,25 @@ __device__ inline float2 packed_shfl_down_sync<float2>(uint32_t mask, const floa
     return r;
 }
 /**
+ * @brief Perform a shuffle xor operation on a packed type synchronously across a warp.
+ * @tparam T The type of the value to be shuffled.
+ * @param mask[in] The mask of active threads.
+ * @param f[in] The value to be shuffled.
+ * @param lane_mask[in] The xor mask used to select the source lane.
+ * @return The result of the shuffle operation.
+ */
+template<typename T>
+__device__ static inline T packed_shfl_xor_sync(uint32_t mask, const T &f, int lane_mask) {
+    return __shfl_xor_sync(mask, f, lane_mask);
+}
+template<>
+__device__ inline float2 packed_shfl_xor_sync<float2>(uint32_t mask, const float2 &f, int lane_mask) {
+    float2 r;
+    r.x = __shfl_xor_sync(mask, f.x, lane_mask);
+    r.y = __shfl_xor_sync(mask, f.y, lane_mask);
+    return r;
+}
+/**
  * @brief Perform a packed shuffle operation synchronously across a warp.
  * @tparam T The type of the value to be shuffled.
  * @param mask[in] The mask of active threads.
