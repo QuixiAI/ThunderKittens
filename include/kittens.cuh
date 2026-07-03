@@ -9,6 +9,11 @@
 #if defined(KITTENS_AMPERE)
 #define KITTENS_SM80
 #endif
+// SM86 (consumer Ampere, e.g. RTX 3090) is the SM80 family with a smaller
+// shared-memory budget; everything else follows the SM80 paths.
+#if defined(KITTENS_SM86) && !defined(KITTENS_SM80)
+#define KITTENS_SM80
+#endif
 #if defined(KITTENS_HOPPER)
 #define KITTENS_SM90
 #endif

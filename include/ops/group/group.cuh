@@ -60,6 +60,23 @@ template<int n_reg> __device__ static inline void decrease_registers() {
 __device__ static inline void producer_registers() { decrease_registers<24>(); }
 template<int NCWG> __device__ static inline void consumer_registers() { increase_registers<480/NCWG - 8*(NCWG>3) - 224*(NCWG==1)>(); }
 
+#else
+
+// setmaxnreg does not exist before sm_90; register reallocation is a no-op on
+// Ampere so producer/consumer kernel setup hooks compile unchanged.
+template<int n_reg> __device__ static inline void increase_registers() {
+    static_assert(n_reg % 8 == 0, "n_reg must be a multiple of 8");
+}
+template<int n_reg> __device__ static inline void decrease_registers() {
+    static_assert(n_reg % 8 == 0, "n_reg must be a multiple of 8");
+}
+__device__ static inline void producer_registers() {}
+template<int NCWG> __device__ static inline void consumer_registers() {}
+
+#endif
+
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
+
 // ---- TMA operations ----
 // These must be included here because
 //   1. We want parallel scope with single-thread ops (i.e., tma:: and tma::cluster)

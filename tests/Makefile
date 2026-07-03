@@ -32,7 +32,9 @@ NVCCFLAGS+= -O3 --threads=0 -diag-suppress 20054 --dlto
 endif
 
 # Compiler flags based on architecture target
-ifeq ($(ARCH),SM80)
+ifeq ($(ARCH),SM86)
+NVCCFLAGS+= -gencode arch=compute_86,code=sm_86 -DKITTENS_SM86 -lcuda -lcudart
+else ifeq ($(ARCH),SM80)
 NVCCFLAGS+= -gencode arch=compute_80a,code=sm_80 -DKITTENS_SM80 -lcuda -lcudart
 else ifeq ($(ARCH),SM90)
 NVCCFLAGS+= -gencode arch=compute_90a,code=sm_90a -DKITTENS_SM90 -lcuda -lcudart

@@ -236,6 +236,8 @@ void initialize(T **d_i, T **d_o, std::vector<float> &i_ref, std::vector<float> 
 }
 
 // Initializer for multi-gpu tests
+// (multi-GPU tests need vmm/pgl, which are SM90+ features)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 template<int NUM_DEVICES, typename T, initializers initializer=initializers::RANDOM, int SEED=42>
 static void initialize(
     T **d_i_arr,
@@ -319,6 +321,7 @@ static void initialize(
     kittens::detail::vmm::vm_free(d_i_mc_handle);
     kittens::detail::vmm::vm_free(d_o_mc_handle);
 }
+#endif
 
 extern int should_write_outputs;
 template<typename T>
@@ -440,6 +443,7 @@ test_result validate(T *d_i, T *d_o, const std::vector<float> &i_ref, std::vecto
 }
 
 // Validation for multi-gpu tests
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 template<int NUM_DEVICES, kittens::ducks::pgl::all PGL, typename T>
 test_result validate(
     PGL &input,
@@ -569,3 +573,4 @@ test_result validate(
     CudaCheckError();
     return good ? test_result::PASSED : test_result::FAILED;
 }
+#endif

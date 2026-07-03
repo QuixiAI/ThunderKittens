@@ -9,6 +9,11 @@ using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::lcsf;
 struct mamba2_fwd_layout {
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
+    static constexpr int NWG = 2; // consumer warpgroups
+#else
+    static constexpr int NWG = 1; // Ampere: one warpgroup fits the 99KB budget
+#endif
 	using q_tile   = st_bf<64, 64>;
 	using k_tile   = st_bf<64, 64>;
 	using v_tile   = st_bf<64, 64>;
@@ -23,16 +28,16 @@ struct mamba2_fwd_layout {
 	struct input_block    { 
         q_tile q;
         k_tile k;
-        v_tile v[2];
-        a_vec  a[2];
+        v_tile v[NWG];
+        a_vec  a[NWG];
         a_vec  padding[6];
     };
     struct output_block {
-        o_tile o[2];
+        o_tile o[NWG];
     };
 	struct scratch_block  { 
-        st_bf<64, 64> kv[2], k[2];
-        a_vec         a_cumsum[2];
+        st_bf<64, 64> kv[NWG], k[NWG];
+        a_vec         a_cumsum[NWG];
         a_vec         padding[6];
     };
     struct common_state {
@@ -48,7 +53,11 @@ struct mamba2_fwd_layout {
 	};
 };
 struct mamba2_fwd_template {
-	static constexpr int NUM_CONSUMER_WARPS=8, OUTPUT_PIPE_STAGES=2, INPUT_PIPE_STAGES=2, PRODUCER_BARRIER_ARRIVALS=1, CONSUMER_BARRIER_ARRIVALS=NUM_CONSUMER_WARPS/4;
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
+	static constexpr int NUM_CONSUMER_WARPS=4*mamba2_fwd_layout::NWG, OUTPUT_PIPE_STAGES=2, INPUT_PIPE_STAGES=2, PRODUCER_BARRIER_ARRIVALS=1, CONSUMER_BARRIER_ARRIVALS=NUM_CONSUMER_WARPS/4;
+#else
+	static constexpr int NUM_CONSUMER_WARPS=4*mamba2_fwd_layout::NWG, OUTPUT_PIPE_STAGES=2, INPUT_PIPE_STAGES=2, PRODUCER_BARRIER_ARRIVALS=32, CONSUMER_BARRIER_ARRIVALS=NUM_CONSUMER_WARPS/4;
+#endif
 	using layout = mamba2_fwd_layout;
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         // args.common.batch = blockIdx.y;
@@ -57,7 +66,7 @@ struct mamba2_fwd_template {
         int task_id = args.task_iter * gridDim.x + blockIdx.x;
 		args.common.batch = task_id / (args.globals.V.depth()/(NUM_CONSUMER_WARPS/4)); // batch = id / heads.
 		task_id -= args.common.batch*(args.globals.V.depth()/(NUM_CONSUMER_WARPS/4));
-		args.common.head = task_id*2; // stride 2 on heads
+		args.common.head = task_id*(NUM_CONSUMER_WARPS/4); // stride NWG on heads
 		args.num_iters = args.common.batch < args.globals.Q.batch() ? args.globals.K.rows()/layout::k_tile::rows : -1;
     }
 	struct producer {
@@ -66,6 +75,7 @@ struct mamba2_fwd_template {
 		}
 		__device__ static void load(producer_load_args<layout> args) {
 			if(warpgroup::warpid() == args.iter%4) {
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
                 warp::tma::expect(args.inputs_arrived, args.input.q, args.input.k, args.input.v[0], args.input.a[0], args.input.v[1], args.input.a[1]);
                 warp::tma::load_async(args.input.q, args.globals.Q, {args.common.batch, 0, args.iter, 0}, args.inputs_arrived);
                 warp::tma::load_async(args.input.k, args.globals.K, {args.common.batch, 0, args.iter, 0}, args.inputs_arrived);
@@ -75,10 +85,22 @@ struct mamba2_fwd_template {
                     warp::tma::load_async(args.input.a[i], args.globals.A, {args.common.batch,  args.common.head+i, 0, args.iter}, args.inputs_arrived);
                 }
                 __syncwarp();
+#else
+                warp::load_async(args.input.q, args.globals.Q, {args.common.batch, 0, args.iter, 0});
+                warp::load_async(args.input.k, args.globals.K, {args.common.batch, 0, args.iter, 0});
+                #pragma unroll
+                for(int i = 0; i < NUM_CONSUMER_WARPS/4; i++) {
+                    warp::load_async(args.input.v[i], args.globals.V, {args.common.batch,  args.common.head+i, args.iter, 0});
+                    warp::load_async(args.input.a[i], args.globals.A, {args.common.batch,  args.common.head+i, 0, args.iter});
+                }
+                kittens::load_async_arrive(args.inputs_arrived); // 32 arrivals fire when cp.asyncs land
+                __syncwarp();
+#endif
             }
 		}
         __device__ static void store(producer_store_args<layout> args) {
             if(warpgroup::warpid() == args.iter%4) {
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
                 #pragma unroll
                 for(int i = 0; i < NUM_CONSUMER_WARPS/4; i++) {
                     warp::tma::store_async(args.globals.O, args.output.o[i], {args.common.batch, args.common.head+i, args.iter, 0});
@@ -87,6 +109,15 @@ struct mamba2_fwd_template {
                 __syncwarp();
                 if(laneid() == 0) arrive(args.outputs_finished);
                 __syncwarp();
+#else
+                #pragma unroll
+                for(int i = 0; i < NUM_CONSUMER_WARPS/4; i++) {
+                    warp::store(args.globals.O, args.output.o[i], {args.common.batch, args.common.head+i, args.iter, 0});
+                }
+                __syncwarp();
+                if(laneid() == 0) arrive(args.outputs_finished, 32);
+                __syncwarp();
+#endif
             }
         }
 	};

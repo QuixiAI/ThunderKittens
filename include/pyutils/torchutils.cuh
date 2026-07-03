@@ -2,9 +2,12 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/core/Tensor.h>
+#include <torch/csrc/utils/pybind.h>
 
 #include "kittens.cuh"
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 #include "parallel_tensor.cuh"
+#endif
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -82,6 +85,7 @@ __host__ static inline void tensor_check(const at::Tensor &t) {
     }
 }
 
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 template <kittens::ducks::pgl::all PGL, bool TypeCheck = true>
 __host__ static inline void parallel_tensor_check(const TKParallelTensor& t) {
     tensor_check<PGL, TypeCheck>(t.data_);
@@ -93,6 +97,7 @@ __host__ static inline void parallel_tensor_check(const TKParallelTensor& t) {
     TORCH_CHECK(t.multicast_ == PGL::multicast, "Multicast mismatch between PGL and TKParallelTensor");
     TORCH_CHECK(t.raw_ptrs_[t.local_rank_] == reinterpret_cast<void *>(t.data_.data_ptr()), "Current tensor data pointer not found in TKParallelTensor's raw_ptrs_");
 }
+#endif
 
 template <kittens::ducks::gl::all GL, bool TypeCheck = true>
 __host__ static inline GL tensor_to_gl(const at::Tensor &t) {
@@ -114,6 +119,7 @@ __host__ static inline GL tensor_to_gl(const at::Tensor &t, int B, int D, int R,
     return ::kittens::make_gl<GL>(reinterpret_cast<uint64_t>(t.data_ptr()), B, D, R, C);
 }
 
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 template <kittens::ducks::pgl::all PGL, bool TypeCheck = true>
 __host__ static inline PGL parallel_tensor_to_pgl(TKParallelTensor &t) {
     parallel_tensor_check<PGL, TypeCheck>(t);
@@ -142,6 +148,7 @@ __host__ static inline PGL parallel_tensor_to_pgl(TKParallelTensor &t, int B, in
         return ::kittens::make_pgl<PGL>(
             reinterpret_cast<uint64_t *>(t.raw_ptrs_.data()), B, D, R, C);
 }
+#endif
 
 template <kittens::ducks::gl::all GL>
 __host__ static inline GL make_fake_gl(const int batch, const int depth, const int rows, const int cols) {
@@ -157,6 +164,7 @@ __host__ static inline void device_check(const T1& first, const Ts&... rest) {
     (_device_check(first, rest), ...);
 }
 
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 __host__ static inline void _parallel_tensor_check(const TKParallelTensor& first, const TKParallelTensor& second) {
     TORCH_CHECK(first.local_rank_ == second.local_rank_, "All parallel tensors must have the same local_rank");
     TORCH_CHECK(first.local_world_size_ == second.local_world_size_, "All parallel tensors must have the same local_world_size");
@@ -166,6 +174,7 @@ template <typename T1, typename... Ts>
 __host__ static inline void parallel_tensor_check(const T1& first, const Ts&... rest) {
     (_parallel_tensor_check(first, rest), ...);
 }
+#endif
 
 template <typename Config>
 concept static_grid = requires { Config::NUM_BLOCKS; };

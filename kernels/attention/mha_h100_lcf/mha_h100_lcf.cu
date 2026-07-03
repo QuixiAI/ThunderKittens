@@ -3,6 +3,8 @@
     two-stage pipeline with minimal boilerplate. TK pipeline templates are also used in our matrix multiply, rotary, 
     mamba, and fftconv kernels -- they're pretty flexible. Note that this is NOT the kernel benchmarked in the paper.
 */
+#include <chrono>
+
 #include "kittens.cuh"
 #include "prototype.cuh"
 

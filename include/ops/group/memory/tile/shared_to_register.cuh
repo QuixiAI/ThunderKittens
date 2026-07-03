@@ -72,6 +72,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
                 // handle the row-major layout for 32-bit types
                 int row = (local_warpid*warp_height + i)*RT::tile_size_row + (warp_laneid / 4);
                 int col = j*RT::tile_size_col + 2*(warp_laneid % 4);
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
                 if constexpr (ST::rows != ST::underlying_rows || ST::cols != ST::underlying_cols) { // subtile case
                     row += src.row_offset;
                     col += src.col_offset;
@@ -103,6 +104,24 @@ __device__ inline static void load(RT &dst, const ST &src) {
                         dst.tiles[i][j].data[k] = T2{dst.tiles[i][j].data[k].y, dst.tiles[i][j].data[k].x};
                     }
                 }
+#else
+                // Ampere: plain idx()-based loads, mirroring the store-side fix
+                // (the hand-rolled swizzle+blit path is inconsistent with
+                // st::idx() in some contexts here; verified empirically on SM86).
+                U2 tmp[4];
+                move<U>::lds(tmp[0].x, src.idx(shared_addr, {row+0, col+0}));
+                move<U>::lds(tmp[0].y, src.idx(shared_addr, {row+0, col+1}));
+                move<U>::lds(tmp[1].x, src.idx(shared_addr, {row+8, col+0}));
+                move<U>::lds(tmp[1].y, src.idx(shared_addr, {row+8, col+1}));
+                move<U>::lds(tmp[2].x, src.idx(shared_addr, {row+0, col+8}));
+                move<U>::lds(tmp[2].y, src.idx(shared_addr, {row+0, col+9}));
+                move<U>::lds(tmp[3].x, src.idx(shared_addr, {row+8, col+8}));
+                move<U>::lds(tmp[3].y, src.idx(shared_addr, {row+8, col+9}));
+                dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(tmp[0]);
+                dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(tmp[1]);
+                dst.tiles[i][j].data[2] = base_types::convertor<T2, U2>::convert(tmp[2]);
+                dst.tiles[i][j].data[3] = base_types::convertor<T2, U2>::convert(tmp[3]);
+#endif
             }
             else {
                 // handle the column-major layout
@@ -220,6 +239,7 @@ __device__ inline static void store(ST &dst, const RT &src) {
                 // handle the row-major layout for 32-bit types
                 int row = (local_warpid*warp_height + i)*RT::tile_size_row + (warp_laneid / 4);
                 int col = j*RT::tile_size_col + 2*(warp_laneid % 4);
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
                 if constexpr (ST::rows != ST::underlying_rows || ST::cols != ST::underlying_cols) { // subtile case
                     row += dst.row_offset;
                     col += dst.col_offset;
@@ -258,6 +278,25 @@ __device__ inline static void store(ST &dst, const RT &src) {
                 move<U>::sts((addr_2+ 4)^swizzle_2, tmp[1].y);
                 move<U>::sts((addr_2+32)^swizzle_2, tmp[3].x);
                 move<U>::sts((addr_2+36)^swizzle_2, tmp[3].y);
+#else
+                // Ampere: plain idx()-based stores. The hand-rolled swizzle+blit
+                // fast path above produces addresses inconsistent with st::idx()
+                // in some contexts here (verified empirically on SM86); the
+                // canonical form is unconditionally correct.
+                U2 tmp[4];
+                tmp[0] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[0]);
+                tmp[1] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[1]);
+                tmp[2] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[2]);
+                tmp[3] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[3]);
+                move<U>::sts(dst.idx(shared_addr, {row+0, col+0}), tmp[0].x);
+                move<U>::sts(dst.idx(shared_addr, {row+0, col+1}), tmp[0].y);
+                move<U>::sts(dst.idx(shared_addr, {row+8, col+0}), tmp[1].x);
+                move<U>::sts(dst.idx(shared_addr, {row+8, col+1}), tmp[1].y);
+                move<U>::sts(dst.idx(shared_addr, {row+0, col+8}), tmp[2].x);
+                move<U>::sts(dst.idx(shared_addr, {row+0, col+9}), tmp[2].y);
+                move<U>::sts(dst.idx(shared_addr, {row+8, col+8}), tmp[3].x);
+                move<U>::sts(dst.idx(shared_addr, {row+8, col+9}), tmp[3].y);
+#endif
             }
             else {
                 // handle the column-major layout

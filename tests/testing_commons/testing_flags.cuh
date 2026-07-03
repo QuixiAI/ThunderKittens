@@ -133,7 +133,9 @@
 #define NUM_GPUS 2
 
 // Macro for testing all the multi-gpu-related tests
-#if defined(TEST_ALL_MULTI_GPU) && NUM_GPUS > 1
+// (multi-GPU pgl/TMA requires SM90+)
+#if defined(TEST_ALL_MULTI_GPU) && NUM_GPUS > 1 && \
+    (defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120))
 #define TEST_THREAD_MEMORY_TILE_TMA_PGL
 #define TEST_THREAD_MEMORY_VEC_TMA_PGL
 #endif

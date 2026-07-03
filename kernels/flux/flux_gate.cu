@@ -66,8 +66,14 @@ template<int BLOCK_M, int BLOCK_N, int BLOCK_K, int _transpose_lhs=0, int _trans
 struct flux_matmul_gate_template {
     constexpr static bool transpose_lhs = _transpose_lhs, transpose_rhs = _transpose_rhs;
     using layout = flux_matmul_gate_layout<BLOCK_M, BLOCK_N, BLOCK_K, transpose_lhs, transpose_rhs>;
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     static constexpr int NUM_CONSUMER_WARPS = BLOCK_M/16, NUM_CONSUMER_WARPGROUPS = NUM_CONSUMER_WARPS / 4,
                          INPUT_PIPE_STAGES = 4;
+#else
+    // Ampere: 2 stages fit 99KB; producer warpgroup's 128 cp.async lanes arrive.
+    static constexpr int NUM_CONSUMER_WARPS = BLOCK_M/16, NUM_CONSUMER_WARPGROUPS = NUM_CONSUMER_WARPS / 4,
+                         INPUT_PIPE_STAGES = 2, PRODUCER_BARRIER_ARRIVALS = 128;
+#endif
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         if(args.task_iter == 0) {
             args.num_iters = transpose_lhs ? args.globals.lhs.rows() / BLOCK_K : args.globals.lhs.cols() / BLOCK_K;
@@ -79,6 +85,7 @@ struct flux_matmul_gate_template {
             warpgroup::decrease_registers<32>(); // decrease registers for the producer warpgroup
         }
         __device__ static void load(producer_load_args<layout> args) { // semaphore for the producer to load into
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
             if(warpgroup::laneid() == 0) {
                 tma::expect(args.inputs_arrived, args.input);
                 for(int i = 0; i < NUM_CONSUMER_WARPGROUPS; i++) {
@@ -93,6 +100,19 @@ struct flux_matmul_gate_template {
                     tma::load_async(args.input.rhs, args.globals.rhs, {args.iter, (int)blockIdx.y}, args.inputs_arrived);
                 if(laneid() == 0) arrive(args.inputs_arrived, 3);
             }
+#else
+            for(int i = 0; i < NUM_CONSUMER_WARPGROUPS; i++) {
+                if constexpr (transpose_lhs)
+                    warpgroup::load_async(args.input.lhs[i], args.globals.lhs, {args.iter, (int)blockIdx.x*NUM_CONSUMER_WARPGROUPS+i});
+                else
+                    warpgroup::load_async(args.input.lhs[i], args.globals.lhs, {(int)blockIdx.x*NUM_CONSUMER_WARPGROUPS+i, args.iter});
+            }
+            if constexpr (transpose_rhs)
+                warpgroup::load_async(args.input.rhs, args.globals.rhs, {(int)blockIdx.y, args.iter});
+            else
+                warpgroup::load_async(args.input.rhs, args.globals.rhs, {args.iter, (int)blockIdx.y});
+            warpgroup::load_async_arrive(args.inputs_arrived); // 128 lanes arrive when copies land
+#endif
         }
     };
     struct consumer {
@@ -124,14 +144,20 @@ struct flux_matmul_gate_template {
             wg_rt_sv_op<base_ops::sum>(args.state.acc, args.finish.acc[warpgroup::groupid()]); // add y onto acc
             warpgroup::store(args.finish.acc[warpgroup::groupid()], args.state.acc); // now that we're done with that, store the result into same slot.
             warpgroup::sync(warpgroup::groupid());
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
             if(warpgroup::laneid() == 0) {
                 tma::store_async(args.globals.acc, args.finish.acc[warpgroup::groupid()], idx);
             }
+#else
+            warpgroup::store(args.globals.acc, args.finish.acc[warpgroup::groupid()], idx);
+            warpgroup::sync(warpgroup::groupid());
+#endif
             if(laneid() == 0) arrive(args.finish_finished);
         }
     };
 };
 
+#include <chrono>
 #include <iostream>
 #include <random>
 
@@ -342,8 +368,12 @@ void run_bench(int M, int N, int K) {
 
 int main() {
     constexpr int transpose_lhs = 0, transpose_rhs = 1;
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     run_bench<flux_matmul_gate_template<192, 192, 64>>(192*12, 192*11, 8192);
     run_bench<flux_matmul_gate_template<128, 256, 64>>(128*12, 256*11, 8192);
+#else
+    run_bench<flux_matmul_gate_template<128, 128, 64>>(2048, 2048, 8192);
+#endif
     // run_bench<flux_matmul_gate_template<128, 14*16, 64>>(4096, 4096*7/8, 4096);
     // run_bench<flux_matmul_gate_template<128, 256, 64>>(2048, 2048, 2048*7);
 
@@ -446,8 +476,13 @@ at::Tensor fused_flux_linear_gate(
     bf16 *d_out = reinterpret_cast<bf16*>(out_bf16);
 
     if (M > 512) {
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
         const int M_tile = 192;
         const int K_tile = 192;
+#else
+        const int M_tile = 128; // Ampere: 8 consumer warps, 64-reg accumulators
+        const int K_tile = 128;
+#endif
         const int N_tile = 64;
 
         dispatch_fused_flux_linear_gate<M_tile, K_tile, N_tile, false, false>(d_x, d_weight, d_bias, d_gate, d_y, d_out, M, K, N);

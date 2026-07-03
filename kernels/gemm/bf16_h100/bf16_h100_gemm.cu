@@ -15,15 +15,27 @@ struct matmul_layout {
     struct common_state   { int2 coord; };
     struct consumer_state { rt_fl<16, N_BLOCK*base_tile::cols> accum; };
 };
-template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12>
+template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12, int _STAGES=0>
 struct matmul_template {
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
     using layout    = matmul_layout<M_BLOCK, N_BLOCK>;
     using wide_tile = st_bf<64, 64*N_BLOCK>;
-    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
+    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=(_STAGES ? _STAGES : 4), PRODUCER_BARRIER_ARRIVALS=1;
+#else
+    // Ampere: 2-3 pipeline stages fit the 99KB (SM86) budget; the whole producer
+    // warpgroup issues cp.async and its 128 lanes arrive on completion.
+    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=(_STAGES ? _STAGES : 2), PRODUCER_BARRIER_ARRIVALS=128;
+#endif
     // Helper functions
     template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
         return dim3(PERISISTENT_GRID ? 132 : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+#else
+        int sms = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+        return dim3(PERISISTENT_GRID ? sms : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+#endif
     }
     // ThunderKittens template functions
     __device__ static inline void common_setup(common_setup_args<layout> args) {
@@ -52,6 +64,7 @@ struct matmul_template {
             warpgroup::decrease_registers<40>(); // decrease registers for producers
         }
         __device__ static void load(producer_load_args<layout> args) {
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
             if (warpgroup::laneid() == 0) {
                 tma::expect(args.inputs_arrived, args.input);
                 for(int i = 0; i < M_BLOCK; i++)
@@ -61,6 +74,15 @@ struct matmul_template {
                     tma::load_async(args.input.b[i], args.globals.B,
                                     {args.iter, args.common.coord.y+i}, args.inputs_arrived);
             }
+#else
+            for(int i = 0; i < M_BLOCK; i++)
+                warpgroup::load_async(args.input.a[i], args.globals.A,
+                                      {args.common.coord.x+i, args.iter});
+            for(int i = 0; i < N_BLOCK; i++)
+                warpgroup::load_async(args.input.b[i], args.globals.B,
+                                      {args.iter, args.common.coord.y+i});
+            warpgroup::load_async_arrive(args.inputs_arrived); // 128 lanes arrive when copies land
+#endif
         }
     };
     struct consumer {
@@ -80,11 +102,19 @@ struct matmul_template {
         __device__ static void finish(consumer_finish_args<layout> args) {
             warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
             warpgroup::sync(warpgroup::groupid()+4);
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
             if (warpgroup::laneid() == 0) for(int i = 0; i < N_BLOCK; i++) {
                 tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()][i],
                                              {args.common.coord.x, args.common.coord.y+i});
                 tma::store_async_read_wait(); // wait that store is finished before reusing finish memory
             }
+#else
+            for(int i = 0; i < N_BLOCK; i++) {
+                warpgroup::store(args.globals.C, args.finish.c[warpgroup::groupid()][i],
+                                 {args.common.coord.x, args.common.coord.y+i});
+            }
+            warpgroup::sync(warpgroup::groupid()+4);
+#endif
             kittens::warp::zero(args.state.accum);
             if (warp::laneid() == 0) arrive(args.finish_finished);
         }
@@ -212,7 +242,14 @@ int main() {
     // run_benchmark<matmul_template<12>>(4096, 4096, 4096, Rblocks, Cblocks, Rblocks192, Cblocks192);
     int N;
     N = 4096;
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     run_benchmark<matmul_template<2,4,8>>(N, N, N);
+#else
+    // SM86 best config from sweep (2026-07-03): 128x128 block, 3-stage
+    // pipeline, ~28 TFLOP/s on RTX 3090 (cuBLAS: ~57). Swept alternatives:
+    // stages=2 23.7, 64x128 25.4, 64x256 19.3.
+    run_benchmark<matmul_template<2,2,8,3>>(N, N, N);
+#endif
     // N = 3072;
     // run_benchmark<matmul_template<2,4,8>>(N, N, N);
     // run_benchmark<matmul_template<3,3,8>>(N, N, N);

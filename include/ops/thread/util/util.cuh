@@ -188,6 +188,9 @@ template<> struct move<fp8e5m2_4> {
                      "r"(*(uint32_t*)&src1), "r"(*(uint32_t*)&src2), "r"(*(uint32_t*)&src3), "r"(*(uint32_t*)&src4), "r"(dst));
     }
 };
+#endif
+// int8 tensor-core types exist on SM80+ (ldmatrix is sm_75+; stsm4 members are
+// only instantiated when called, and stmatrix callers are all SM90+ paths).
 template<> struct move<int8_4> {
     __device__ static inline void ldsm4(int8_4& dst1, int8_4& dst2, int8_4& dst3, int8_4& dst4, uint32_t src) {
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 {%0, %1, %2, %3}, [%4];\n" :
@@ -208,7 +211,6 @@ template<> struct move<uint8_4> {
                      "r"(*(uint32_t*)&src1), "r"(*(uint32_t*)&src2), "r"(*(uint32_t*)&src3), "r"(*(uint32_t*)&src4), "r"(dst));
     }
 };
-#endif
 
 /* ----------   Constants for Cache policies  ---------- */
 

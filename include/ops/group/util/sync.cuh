@@ -101,6 +101,49 @@ __device__ static inline void arrive(semaphore& sem, uint32_t count) {
         );
     }
 }
+#else
+/**
+* @brief Arrives at a semaphore with an explicit count.
+*
+* The count operand of mbarrier.arrive requires sm_90, so on Ampere lane 0
+* posts `count` single arrivals instead.
+*
+* @param sem Reference to the semaphore variable.
+* @param count The count value for the mbarrier arrival.
+*/
+__device__ static inline void arrive(semaphore& sem, uint32_t count) {
+    if(laneid() == 0) {
+        uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&sem));
+        for(uint32_t i = 0; i < count; i++) {
+            asm volatile (
+                "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];\n"
+                :
+                : "r"(mbar_ptr)
+                : "memory"
+            );
+        }
+    }
+}
+/**
+* @brief Registers an arrival on `sem` that fires once all cp.async copies
+* previously issued by this thread have landed in shared memory.
+*
+* This is the Ampere producer idiom (cp.async.mbarrier.arrive.noinc): every
+* calling thread contributes exactly one arrival, so the semaphore must be
+* initialized with a thread count that includes each thread that will call
+* this after issuing its share of load_async traffic.
+*
+* @param sem Reference to the semaphore variable.
+*/
+__device__ static inline void load_async_arrive(semaphore& sem) {
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&sem));
+    asm volatile (
+        "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n"
+        :
+        : "r"(mbar_ptr)
+        : "memory"
+    );
+}
 #endif
 
 /**

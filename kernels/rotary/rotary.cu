@@ -24,7 +24,15 @@ template<int _headdim, int _warps> struct rotary_layout {
     struct consumer_state { rt_fl<16, headdim/2> sin, cos; }; // long-resident tiles
 };
 template<int _headdim> struct rotary_template {
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     static constexpr int headdim=_headdim, NUM_CONSUMER_WARPS=8, NUM_BLOCKS=1, OUTPUT_PIPE_STAGES=3, INPUT_PIPE_STAGES=3;
+#else
+    // Ampere: halve the consumer warps at headdim=128 to fit the 99KB (SM86)
+    // shared memory budget; producer arrivals come from one warp's cp.async
+    // completions (32 lanes) instead of TMA transaction counts.
+    static constexpr int headdim=_headdim, NUM_CONSUMER_WARPS=(_headdim==128 ? 4 : 8), NUM_BLOCKS=1, OUTPUT_PIPE_STAGES=3, INPUT_PIPE_STAGES=3;
+    static constexpr int PRODUCER_BARRIER_ARRIVALS=32;
+#endif
     using layout = rotary_layout<headdim, NUM_CONSUMER_WARPS>;
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         if(args.task_iter == 0) {
@@ -44,12 +52,20 @@ template<int _headdim> struct rotary_template {
                                        args.iter%args.globals.x.depth(),
                                        blockIdx.x*NUM_CONSUMER_WARPS,
                                        0 };
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
                 warp::tma::expect_bytes(args.inputs_arrived, sizeof(layout::seq_tile)*args.state.active_warps);
                 for(int i = 0; i < args.state.active_warps; i++) {
                     warp::tma::load_async(args.input.x[i], args.globals.x, {idx.b,idx.d,idx.r+i,idx.c}, args.inputs_arrived);
                 }
                 if(laneid() == 0) arrive(args.inputs_arrived, 3);
                 __syncwarp();
+#else
+                for(int i = 0; i < args.state.active_warps; i++) {
+                    warp::load_async(args.input.x[i], args.globals.x, {idx.b,idx.d,idx.r+i,idx.c});
+                }
+                kittens::load_async_arrive(args.inputs_arrived); // 32 arrivals fire when the cp.asyncs land
+                __syncwarp();
+#endif
             }
         }
         __device__ static void store(producer_store_args<layout> args) {
@@ -58,21 +74,33 @@ template<int _headdim> struct rotary_template {
                                        args.iter%args.globals.x.depth(),
                                        blockIdx.x*NUM_CONSUMER_WARPS,
                                        0 };
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
                 for(int i = 0; i < args.state.active_warps; i++) {
                     warp::tma::store_async(args.globals.o, args.output.o[i], {idx.b,idx.d,idx.r+i,idx.c});
                 }
                 warp::tma::store_async_read_wait();
                 if(laneid() == 0) arrive(args.outputs_finished, 4);
                 __syncwarp();
+#else
+                for(int i = 0; i < args.state.active_warps; i++) {
+                    warp::store(args.globals.o, args.output.o[i], {idx.b,idx.d,idx.r+i,idx.c});
+                }
+                __syncwarp();
+                if(laneid() == 0) arrive(args.outputs_finished, 32);
+                __syncwarp();
+#endif
             }
         }
     };
     struct consumer {
         __device__ static void setup(consumer_setup_args<layout> args) {
             warpgroup::consumer_registers<NUM_CONSUMER_WARPS/4>();
-            kittens::coord idx = { blockIdx.x*NUM_CONSUMER_WARPS + warpid(), 0 };
-            warp::load(args.state.sin, args.globals.sin, idx); // could be better coalesced but doing just once
-            warp::load(args.state.cos, args.globals.cos, idx);
+            // NOTE: pass the coordinate inline so it takes the load's default
+            // tile-typed coord (units of 16-row tiles). A bare kittens::coord
+            // is element-typed and made every warp read sin/cos rows w..w+15
+            // instead of 16w..16w+15.
+            warp::load(args.state.sin, args.globals.sin, {blockIdx.x*NUM_CONSUMER_WARPS + warpid(), 0});
+            warp::load(args.state.cos, args.globals.cos, {blockIdx.x*NUM_CONSUMER_WARPS + warpid(), 0});
         }
         __device__ static void compute(consumer_compute_args<layout> args) {
             rt_fl<16, headdim> x;
@@ -80,6 +108,12 @@ template<int _headdim> struct rotary_template {
             warp::load(x, args.input.x[warpid()]);
             if(laneid() == 0) arrive(args.inputs_finished);
             __syncwarp();
+#ifdef ROTARY_DEBUG_IDENTITY
+            warp::store(args.output.o[warpid()], x);
+            __syncwarp();
+            if(laneid() == 0) arrive(args.outputs_arrived);
+            return;
+#endif
             for(int i = 0; i < headdim/32; i++) {
                 #pragma unroll
                 for(int j = 0; j < 4; j++) {

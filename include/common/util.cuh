@@ -63,8 +63,10 @@ __device__ __forceinline__ int smid() {
     return static_cast<int>(r);
 }
 
-#if defined(KITTENS_SM80)
-constexpr int MAX_SHARED_MEMORY = 163 * 1024;
+#if defined(KITTENS_SM86)
+constexpr int MAX_SHARED_MEMORY = 99 * 1024; // consumer Ampere (GA102/RTX 3090)
+#elif defined(KITTENS_SM80)
+constexpr int MAX_SHARED_MEMORY = 163 * 1024; // A100
 #elif defined(KITTENS_SM90) || defined(KITTENS_SM10X)
 constexpr int MAX_SHARED_MEMORY = 227 * 1024;
 #elif defined(KITTENS_SM120)

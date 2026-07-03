@@ -4,6 +4,7 @@
 #define RUN_MAIN
 #endif
 
+#include <chrono>
 #include "kittens.cuh"
 #include "prototype.cuh"
 
@@ -63,6 +64,10 @@ template<int BLOCK_M, int BLOCK_N, int BLOCK_K, int transpose_lhs, int transpose
 struct flux_matmul_gelu_template {
     using layout = flux_matmul_gelu_layout<BLOCK_M, BLOCK_N, BLOCK_K, transpose_lhs, transpose_rhs>;
     static constexpr int NUM_CONSUMER_WARPS = BLOCK_M/16, NUM_CONSUMER_WARPGROUPS = NUM_CONSUMER_WARPS/4;
+#if !defined(KITTENS_SM90) && !defined(KITTENS_SM10X) && !defined(KITTENS_SM120)
+    // Ampere: 2 stages fit 99KB; producer warpgroup's 128 cp.async lanes arrive.
+    static constexpr int INPUT_PIPE_STAGES = 2, PRODUCER_BARRIER_ARRIVALS = 128;
+#endif
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         if(args.task_iter == 0) {
             args.num_iters = transpose_lhs ? args.globals.lhs.rows() / BLOCK_K : args.globals.lhs.cols() / BLOCK_K;
@@ -74,6 +79,7 @@ struct flux_matmul_gelu_template {
             warpgroup::producer_registers(); // decrease registers for the producer warpgroup
         }
         __device__ static void load(producer_load_args<layout> args) { // semaphore for the producer to load into
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
             if(warpgroup::laneid() == 0) {
                 tma::expect_bytes(args.inputs_arrived, sizeof(layout::input_block));
                 for(int i = 0; i < NUM_CONSUMER_WARPGROUPS; i++) {
@@ -88,6 +94,19 @@ struct flux_matmul_gelu_template {
                     tma::load_async(args.input.rhs, args.globals.rhs, {args.iter, (int)blockIdx.y}, args.inputs_arrived);
                 if(laneid() == 0) arrive(args.inputs_arrived, 3);
             }
+#else
+            for(int i = 0; i < NUM_CONSUMER_WARPGROUPS; i++) {
+                if constexpr (transpose_lhs)
+                    warpgroup::load_async(args.input.lhs[i], args.globals.lhs, {args.iter, (int)blockIdx.x*NUM_CONSUMER_WARPGROUPS+i});
+                else
+                    warpgroup::load_async(args.input.lhs[i], args.globals.lhs, {(int)blockIdx.x*NUM_CONSUMER_WARPGROUPS+i, args.iter});
+            }
+            if constexpr (transpose_rhs)
+                warpgroup::load_async(args.input.rhs, args.globals.rhs, {(int)blockIdx.y, args.iter});
+            else
+                warpgroup::load_async(args.input.rhs, args.globals.rhs, {args.iter, (int)blockIdx.y});
+            warpgroup::load_async_arrive(args.inputs_arrived); // 128 lanes arrive when copies land
+#endif
         }
     };
     struct consumer {
@@ -122,9 +141,15 @@ struct flux_matmul_gelu_template {
             }
             warpgroup::store(args.finish.acc[warpgroup::groupid()], args.state.acc);
             warpgroup::sync(warpgroup::groupid());
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
             if(warpgroup::laneid() == 0)
                 tma::store_async(args.globals.acc, args.finish.acc[warpgroup::groupid()],
                 {(int)blockIdx.x*NUM_CONSUMER_WARPGROUPS + warpgroup::groupid(), (int)blockIdx.y});
+#else
+            warpgroup::store(args.globals.acc, args.finish.acc[warpgroup::groupid()],
+                {(int)blockIdx.x*NUM_CONSUMER_WARPGROUPS + warpgroup::groupid(), (int)blockIdx.y});
+            warpgroup::sync(warpgroup::groupid());
+#endif
             if(laneid() == 0) arrive(args.finish_finished);
         }
     };
@@ -415,8 +440,13 @@ at::Tensor fused_flux_linear_gelu(
     bf16 *d_out = reinterpret_cast<bf16*>(out_bf16);
 
     if (M > 512) {
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
         const int M_tile = 192;
         const int K_tile = 192;
+#else
+        const int M_tile = 128; // Ampere: 8 consumer warps, 64-reg accumulators
+        const int K_tile = 128;
+#endif
         const int N_tile = 64;
 
         dispatch_fused_flux_linear_gelu<M_tile, K_tile, N_tile, false, true>(d_x, d_weight, d_bias, d_out, M, K, N);

@@ -9,6 +9,9 @@
 // Hopper has its own warpgroup-scope MMA operations.
 #if defined(KITTENS_SM90)
 #include "warpgroup.cuh"
+#elif defined(KITTENS_SM80)
+// Ampere emulates the warpgroup MMA API with warp-scope mma.sync.
+#include "warpgroup_sm80.cuh"
 #endif
 
 // Blackwell has its own MMA operations (Tensor Core Generation 5).
