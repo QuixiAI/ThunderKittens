@@ -1,171 +1,5 @@
-// Paged KV cache machinery + fused v1 decode attention, CUDA/SM86 port of
-// ThunderMittens kernels/kv_cache (core set; fp8 variants + beam kernels follow).
-//
-// Paged layout (the canonical one all serving kernels share, vLLM-compatible):
-//   key_cache/value_cache: (num_blocks, block_size, num_kv_heads, D) contiguous
-//   block_table: (batch, max_blocks) int32, block < 0 = unmapped (skipped)
-//   slot_mapping: (num_tokens,) int64, slot < 0 = padding (skipped)
-//   slot -> address: ((block*block_size + offset)*num_kv_heads + kv_head)*D
-//
-// paged_attention: one warp per (query head, batch); lane owns D/32 elements;
-// online softmax over the context; fused GQA + ALiBi + sliding window +
-// block-sparse mask (mask shares the block_table layout).
-//
-// Build (test harness):
-//   /usr/local/cuda/bin/nvcc kv_cache.cu -std=c++20 -O2 -DKITTENS_SM86 \
-//     -gencode arch=compute_86,code=sm_86 -o kv_cache.out
-#include <cuda_fp16.h>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <vector>
-#include <cmath>
-
-namespace tms {
-
-__device__ __forceinline__ float warp_sum(float v) {
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
-    return v;
-}
-
-template <typename T>
-__global__ void kv_cache_zero(T* key_cache, T* value_cache, size_t n) {
-    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    key_cache[i] = T(0);
-    value_cache[i] = T(0);
-}
-
-// one block per token; threads stride the H_KV*D row
-template <typename T>
-__global__ void kv_cache_scatter(const T* key, const T* value, const int64_t* slot_mapping,
-                                 T* key_cache, T* value_cache,
-                                 int num_heads, int head_size, int block_size) {
-    const int token = blockIdx.x;
-    const int64_t slot = slot_mapping[token];
-    if (slot < 0) return;
-    const int64_t block = slot / block_size, off = slot % block_size;
-    const int row_elems = num_heads * head_size;
-    const int64_t src = int64_t(token) * row_elems;
-    const int64_t dst = (block * block_size + off) * row_elems;
-    for (int i = threadIdx.x; i < row_elems; i += blockDim.x) {
-        key_cache[dst + i] = key[src + i];
-        value_cache[dst + i] = value[src + i];
-    }
-}
-
-// paged -> packed; binary search cu_seq_lens for the owning batch
-template <typename T>
-__global__ void kv_cache_gather(const T* key_cache, const T* value_cache,
-                                T* key_out, T* value_out,
-                                const int* block_table, const int* cu_seq_lens,
-                                int num_tokens, int num_seqs, int block_size,
-                                int bt_stride, int num_heads, int head_size) {
-    const int token = blockIdx.x;
-    if (token >= num_tokens) return;
-    int lo = 0, hi = num_seqs;
-    while (lo < hi) {
-        const int mid = (lo + hi + 1) / 2;
-        if (cu_seq_lens[mid] <= token) lo = mid; else hi = mid - 1;
-    }
-    const int batch = lo, local = token - cu_seq_lens[batch];
-    const int col = local / block_size, slot = local % block_size;
-    const int block = block_table[batch * bt_stride + col];
-    const int row_elems = num_heads * head_size;
-    const int64_t out = int64_t(token) * row_elems;
-    if (block < 0) {
-        for (int i = threadIdx.x; i < row_elems; i += blockDim.x) {
-            key_out[out + i] = T(0);
-            value_out[out + i] = T(0);
-        }
-        return;
-    }
-    const int64_t src = (int64_t(block) * block_size + slot) * row_elems;
-    for (int i = threadIdx.x; i < row_elems; i += blockDim.x) {
-        key_out[out + i] = key_cache[src + i];
-        value_out[out + i] = value_cache[src + i];
-    }
-}
-
-template <typename T>
-__global__ void kv_cache_clone(const T* key_cache, const T* value_cache,
-                               T* key_out, T* value_out, size_t n) {
-    const size_t i = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
-    if (i + 4 <= n) {
-        *reinterpret_cast<float2*>(key_out + i)   = *reinterpret_cast<const float2*>(key_cache + i);
-        *reinterpret_cast<float2*>(value_out + i) = *reinterpret_cast<const float2*>(value_cache + i);
-    } else {
-        for (size_t j = i; j < n; j++) { key_out[j] = key_cache[j]; value_out[j] = value_cache[j]; }
-    }
-}
-
-// src->dst block copies: reads ORIGINAL, writes CLONE (race-free beam-reorder chains)
-template <typename T>
-__global__ void kv_cache_copy_blocks(const T* key_src, const T* value_src,
-                                     T* key_dst, T* value_dst,
-                                     const int64_t* block_mapping,   // (num_pairs, 2), -1 sentinel
-                                     int block_elems) {
-    const int pair = blockIdx.x;
-    const int64_t src = block_mapping[2 * pair], dst = block_mapping[2 * pair + 1];
-    if (src < 0 || dst < 0) return;
-    const int64_t s = src * block_elems, d = dst * block_elems;
-    for (int i = threadIdx.x; i < block_elems; i += blockDim.x) {
-        key_dst[d + i] = key_src[s + i];
-        value_dst[d + i] = value_src[s + i];
-    }
-}
-
-// ---- fused v1 decode: one warp per (head, batch); GQA + ALiBi + window + block-sparse ----
-template <typename T, int D>
-__global__ void paged_attention(const T* q, const T* key_cache, const T* value_cache,
-                                const int* block_table, const int* context_lens, T* out,
-                                int block_size, int bt_stride, float scale,
-                                int num_heads, int num_kv_heads,
-                                const float* alibi_slopes, int use_alibi,
-                                const int* block_mask, int use_mask, int window) {
-    constexpr int VPL = D / 32;
-    const int head = blockIdx.x, batch = blockIdx.y, lane = threadIdx.x;
-    const int kv_head = head / (num_heads / num_kv_heads);
-    const int context_len = context_lens[batch];
-    const int64_t row = (int64_t(batch) * num_heads + head) * D;
-    const int t_start = (window > 0) ? max(0, context_len - window) : 0;
-
-    float qv[VPL], acc[VPL];
-    #pragma unroll
-    for (int i = 0; i < VPL; i++) {
-        qv[i] = float(q[row + lane + 32 * i]);
-        acc[i] = 0.0f;
-    }
-    float m = -3.4028234663852886e38f, l = 0.0f;
-
-    for (int t = t_start; t < context_len; t++) {
-        const int col = t / block_size, slot = t - col * block_size;
-        const int block = block_table[batch * bt_stride + col];
-        if (block < 0) continue;
-        if (use_mask && block_mask[batch * bt_stride + col] == 0) continue;
-        const int64_t base = (int64_t(block) * block_size + slot) * num_kv_heads * D + int64_t(kv_head) * D;
-        float partial = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < VPL; i++) partial += qv[i] * float(key_cache[base + lane + 32 * i]);
-        float score = warp_sum(partial) * scale;
-        if (use_alibi) score += alibi_slopes[head] * float(t - context_len + 1);
-        const float nm = fmaxf(m, score);
-        const float alpha = (l == 0.0f) ? 0.0f : expf(m - nm);
-        const float beta = expf(score - nm);
-        #pragma unroll
-        for (int i = 0; i < VPL; i++)
-            acc[i] = acc[i] * alpha + beta * float(value_cache[base + lane + 32 * i]);
-        l = l * alpha + beta;
-        m = nm;
-    }
-    #pragma unroll
-    for (int i = 0; i < VPL; i++)
-        out[row + lane + 32 * i] = (l == 0.0f) ? T(0) : T(acc[i] / l);
-}
-
-}  // namespace tms
-
+// Harness for kv_cache kernels (kernels live in kv_cache_kernels.cuh).
+#include "kv_cache_kernels.cuh"
 // ============================== test harness ==============================
 using namespace tms;
 
@@ -259,6 +93,79 @@ int main() {
             printf("paged_attention D=%d HKV=%d %-11s max diff %.5f (%s)\n", D, HKV, names[variant],
                    maxd, maxd < 5e-3 ? "PASS" : "FAIL");
             rc |= !(maxd < 5e-3);
+        }
+
+        // gqa_staged: identical math to v1 -> bit-for-bit equal output
+        {
+            __half* dout2;
+            cudaMalloc(&dout2, q.size() * 2);
+            dim3 grid(H, B);
+            if (D == 64) paged_attention<__half, 64><<<grid, 32>>>(dq, dK, dV, dbt, dctx, dout, BS, MAXB, scale, H, HKV, dsl, 0, dmask, 0, 0);
+            else         paged_attention<__half, 128><<<grid, 32>>>(dq, dK, dV, dbt, dctx, dout, BS, MAXB, scale, H, HKV, dsl, 0, dmask, 0, 0);
+            const int gs = H / HKV;
+            dim3 sgrid(HKV, B);
+            if (D == 64) paged_attention_gqa_staged<__half, 64><<<sgrid, 32 * gs>>>(dq, dK, dV, dbt, dctx, dout2, BS, MAXB, scale, H, HKV);
+            else         paged_attention_gqa_staged<__half, 128><<<sgrid, 32 * gs>>>(dq, dK, dV, dbt, dctx, dout2, BS, MAXB, scale, H, HKV);
+            cudaDeviceSynchronize();
+            std::vector<__half> g1(q.size()), g2(q.size());
+            cudaMemcpy(g1.data(), dout, q.size() * 2, cudaMemcpyDeviceToHost);
+            cudaMemcpy(g2.data(), dout2, q.size() * 2, cudaMemcpyDeviceToHost);
+            size_t bad = 0;
+            for (size_t i = 0; i < q.size(); i++)
+                if (__half2float(g1[i]) != __half2float(g2[i])) bad++;
+            printf("gqa_staged D=%d HKV=%d vs v1: %zu mismatches (%s)\n", D, HKV, bad, bad ? "FAIL" : "PASS");
+            rc |= (bad != 0);
+            cudaFree(dout2);
+        }
+
+        // attn_window: dense sliding-window causal vs fp64 full softmax
+        if (HKV == 8) {
+            const int BH = 6, N = 64;
+            std::vector<__half> aq(size_t(BH) * N * D), ak(aq.size()), av(aq.size());
+            for (auto& x : aq) x = __float2half(frand() * 0.5f);
+            for (auto& x : ak) x = __float2half(frand() * 0.5f);
+            for (auto& x : av) x = __float2half(frand() * 0.5f);
+            __half *daq, *dak, *dav, *dao;
+            cudaMalloc(&daq, aq.size() * 2); cudaMalloc(&dak, ak.size() * 2);
+            cudaMalloc(&dav, av.size() * 2); cudaMalloc(&dao, aq.size() * 2);
+            cudaMemcpy(daq, aq.data(), aq.size() * 2, cudaMemcpyHostToDevice);
+            cudaMemcpy(dak, ak.data(), ak.size() * 2, cudaMemcpyHostToDevice);
+            cudaMemcpy(dav, av.data(), av.size() * 2, cudaMemcpyHostToDevice);
+            for (int W : {0, 24}) {
+                dim3 agrid(N, BH);
+                if (D == 64) attn_window<__half, 64><<<agrid, 32>>>(daq, dak, dav, dao, N, scale, W);
+                else         attn_window<__half, 128><<<agrid, 32>>>(daq, dak, dav, dao, N, scale, W);
+                cudaDeviceSynchronize();
+                std::vector<__half> got(aq.size());
+                cudaMemcpy(got.data(), dao, aq.size() * 2, cudaMemcpyDeviceToHost);
+                double maxd = 0;
+                for (int bh = 0; bh < BH; bh++) for (int i = 0; i < N; i++) {
+                    const int j0 = (W > 0) ? std::max(0, i - W + 1) : 0;
+                    std::vector<double> sc;
+                    for (int j = j0; j <= i; j++) {
+                        double s = 0;
+                        for (int d = 0; d < D; d++)
+                            s += double(__half2float(aq[(size_t(bh) * N + i) * D + d]))
+                               * double(__half2float(ak[(size_t(bh) * N + j) * D + d]));
+                        sc.push_back(s * scale);
+                    }
+                    double mx = -1e300;
+                    for (double s : sc) mx = std::max(mx, s);
+                    std::vector<double> o(D, 0.0);
+                    double Z = 0;
+                    for (size_t jj = 0; jj < sc.size(); jj++) {
+                        const double w = exp(sc[jj] - mx);
+                        for (int d = 0; d < D; d++)
+                            o[d] += w * double(__half2float(av[(size_t(bh) * N + j0 + jj) * D + d]));
+                        Z += w;
+                    }
+                    for (int d = 0; d < D; d++)
+                        maxd = std::max(maxd, std::abs(double(__half2float(got[(size_t(bh) * N + i) * D + d])) - o[d] / Z));
+                }
+                printf("attn_window D=%d W=%-2d           max diff %.5f (%s)\n", D, W, maxd, maxd < 5e-3 ? "PASS" : "FAIL");
+                rc |= !(maxd < 5e-3);
+            }
+            cudaFree(daq); cudaFree(dak); cudaFree(dav); cudaFree(dao);
         }
 
         // scatter -> gather round trip

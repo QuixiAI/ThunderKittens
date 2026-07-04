@@ -175,7 +175,116 @@ torch::Tensor py_lm_head_sample(torch::Tensor h, torch::Tensor W, const std::str
     return out;
 }
 
+// ---- fused LM head top-k / top-p sampling (Step 4) ----
+// mode: "top_k" (Gumbel-max among the global top-k) or "top_p" (nucleus with
+// the TRUE full-vocab normalizer from per-tile lses). pool_k = per-tile
+// over-selection size for top-p (>= expected nucleus tail in any tile).
+torch::Tensor py_lm_head_sample_topk(torch::Tensor h, torch::Tensor W, const std::string& fmt,
+                                     int64_t k, double temperature, int64_t seed) {
+    CHECK_CUDA_T(h); CHECK_CUDA_T(W);
+    TORCH_CHECK(h.scalar_type() == torch::kHalf, "h must be fp16");
+    TORCH_CHECK(k >= 1 && k <= LMH_MAX_K, "k must be in [1,64]");
+    const int T = h.size(0), K = h.size(1), V = W.size(0);
+    const int TILE_V = 1024;
+    const int nvt = (V + TILE_V - 1) / TILE_V;
+    const float invtemp = temperature > 0 ? float(1.0 / temperature) : 1.0f;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto pv = torch::empty({T, nvt, k}, h.options().dtype(torch::kFloat));
+    auto pi = torch::empty({T, nvt, k}, h.options().dtype(torch::kInt));
+    auto out = torch::empty({T}, h.options().dtype(torch::kInt));
+    dim3 grid(nvt, T);
+    if (fmt == "fp16") {
+        TORCH_CHECK(W.scalar_type() == torch::kHalf);
+        lm_head_topk_partials<0><<<grid, 32, 0, stream>>>(
+            reinterpret_cast<const half*>(h.data_ptr()), reinterpret_cast<const half*>(W.data_ptr()),
+            pv.data_ptr<float>(), pi.data_ptr<int>(), nullptr, V, K, TILE_V, nvt, int(k), 0,
+            invtemp, nullptr);
+    } else {
+#define X(F) if (fmt == #F) lm_head_topk_partials_q<F, 0><<<grid, 32, 0, stream>>>( \
+            reinterpret_cast<const half*>(h.data_ptr()), W.data_ptr<uint8_t>(), \
+            pv.data_ptr<float>(), pi.data_ptr<int>(), nullptr, V, K, TILE_V, nvt, int(k), 0, \
+            invtemp, nullptr); else
+        TMQ_FORMATS(X)
+#undef X
+        TORCH_CHECK(false, "unknown quant format: ", fmt);
+    }
+    lm_head_topk_reduce<<<T, 32, 0, stream>>>(pv.data_ptr<float>(), pi.data_ptr<int>(),
+        out.data_ptr<int>(), nvt, int(k), unsigned(seed), invtemp);
+    return out;
+}
+torch::Tensor py_lm_head_sample_topp(torch::Tensor h, torch::Tensor W, const std::string& fmt,
+                                     double p, int64_t pool_k, double temperature, int64_t seed) {
+    CHECK_CUDA_T(h); CHECK_CUDA_T(W);
+    TORCH_CHECK(h.scalar_type() == torch::kHalf, "h must be fp16");
+    TORCH_CHECK(pool_k >= 1 && pool_k <= LMH_MAX_K, "pool_k must be in [1,64]");
+    const int T = h.size(0), K = h.size(1), V = W.size(0);
+    const int TILE_V = 1024;
+    const int nvt = (V + TILE_V - 1) / TILE_V;
+    const float invtemp = temperature > 0 ? float(1.0 / temperature) : 1.0f;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto pv = torch::empty({T, nvt, pool_k}, h.options().dtype(torch::kFloat));
+    auto pi = torch::empty({T, nvt, pool_k}, h.options().dtype(torch::kInt));
+    auto lse = torch::empty({T, nvt}, h.options().dtype(torch::kFloat));
+    auto out = torch::empty({T}, h.options().dtype(torch::kInt));
+    dim3 grid(nvt, T);
+    if (fmt == "fp16") {
+        TORCH_CHECK(W.scalar_type() == torch::kHalf);
+        lm_head_topk_partials<1><<<grid, 32, 0, stream>>>(
+            reinterpret_cast<const half*>(h.data_ptr()), reinterpret_cast<const half*>(W.data_ptr()),
+            pv.data_ptr<float>(), pi.data_ptr<int>(), nullptr, V, K, TILE_V, nvt, int(pool_k), 0,
+            invtemp, lse.data_ptr<float>());
+    } else {
+#define X(F) if (fmt == #F) lm_head_topk_partials_q<F, 1><<<grid, 32, 0, stream>>>( \
+            reinterpret_cast<const half*>(h.data_ptr()), W.data_ptr<uint8_t>(), \
+            pv.data_ptr<float>(), pi.data_ptr<int>(), nullptr, V, K, TILE_V, nvt, int(pool_k), 0, \
+            invtemp, lse.data_ptr<float>()); else
+        TMQ_FORMATS(X)
+#undef X
+        TORCH_CHECK(false, "unknown quant format: ", fmt);
+    }
+    lm_head_topp_reduce<<<T, 32, 0, stream>>>(pv.data_ptr<float>(), pi.data_ptr<int>(),
+        out.data_ptr<int>(), nvt, int(pool_k), float(p), unsigned(seed), invtemp,
+        lse.data_ptr<float>());
+    return out;
+}
+
+// ---- Step-4 qgemm variants ----
+torch::Tensor py_qgemm_actorder(torch::Tensor X, torch::Tensor Wq, torch::Tensor perm,
+                                const std::string& fmt) {
+    CHECK_CUDA_T(X); CHECK_CUDA_T(Wq); CHECK_CUDA_T(perm);
+    TORCH_CHECK(X.scalar_type() == torch::kHalf, "X must be fp16");
+    const int M = X.size(0), K = X.size(1), N = Wq.size(0);
+    auto Y = torch::empty({M, N}, X.options().dtype(torch::kFloat));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    dim3 grid(N / 16, (M + 15) / 16);
+#define X(F) if (fmt == #F) { qgemm_actorder<F><<<grid, 32, 0, stream>>>(Y.data_ptr<float>(), \
+        reinterpret_cast<const half*>(X.data_ptr()), Wq.data_ptr<uint8_t>(), \
+        perm.data_ptr<int>(), M, N, K); return Y; }
+    X(q4_0) X(kU4) X(kU4B8) X(q8_0)
+#undef X
+    TORCH_CHECK(false, "qgemm_actorder: unsupported format ", fmt);
+}
+torch::Tensor py_qgemm_blockscale(torch::Tensor X, torch::Tensor Wq, torch::Tensor scale2d) {
+    CHECK_CUDA_T(X); CHECK_CUDA_T(Wq); CHECK_CUDA_T(scale2d);
+    TORCH_CHECK(X.scalar_type() == torch::kHalf && scale2d.scalar_type() == torch::kHalf);
+    const int M = X.size(0), K = X.size(1), N = Wq.size(0);
+    auto Y = torch::empty({M, N}, X.options().dtype(torch::kFloat));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    dim3 grid(N / 16, (M + 15) / 16);
+    qgemm_blockscale<fp8_raw><<<grid, 32, 0, stream>>>(Y.data_ptr<float>(),
+        reinterpret_cast<const half*>(X.data_ptr()), Wq.data_ptr<uint8_t>(),
+        reinterpret_cast<const half*>(scale2d.data_ptr()), M, N, K);
+    return Y;
+}
+
+void init_serving(pybind11::module_& m);       // tm_cuda_serving.cu
+void init_elementwise(pybind11::module_& m);   // tm_cuda_elementwise.cu
+void init_w6(pybind11::module_& m);            // tm_cuda_w6.cu
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    init_serving(m);
+    init_elementwise(m);
+    init_w6(m);
     m.def("qgemv", &py_qgemv, "D(N) = dequant(Wq) @ x, fp16 x");
     m.def("qgemm", &py_qgemm, "Y(M,N) = X(M,K) @ dequant(Wq)^T");
     m.def("qflux_gelu", &py_qflux_gelu, "gelu_tanh(X @ dequant(Wq)^T + bias)");
@@ -184,5 +293,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_per_token", &py_quantize_per_token, "(codes, scale) per row; kind='fp8'|'int8'");
     m.def("quantize_per_tensor", &py_quantize_per_tensor, "(codes, scale); kind='fp8'|'int8'");
     m.def("lm_head_sample", &py_lm_head_sample, "fused head + argmax/categorical; fmt='fp16'|<quant>");
+    m.def("lm_head_sample_topk", &py_lm_head_sample_topk, pybind11::arg("h"), pybind11::arg("W"),
+          pybind11::arg("format") = "fp16", pybind11::arg("k") = 40,
+          pybind11::arg("temperature") = 1.0, pybind11::arg("seed") = 0);
+    m.def("lm_head_sample_topp", &py_lm_head_sample_topp, pybind11::arg("h"), pybind11::arg("W"),
+          pybind11::arg("format") = "fp16", pybind11::arg("p") = 0.9,
+          pybind11::arg("pool_k") = 32, pybind11::arg("temperature") = 1.0,
+          pybind11::arg("seed") = 0);
+    m.def("qgemm_actorder", &py_qgemm_actorder, "GPTQ act-order GEMM; perm (K,) int32");
+    m.def("qgemm_blockscale", &py_qgemm_blockscale, "fp8_raw codes + (N/128,K/128) fp16 scales");
     m.def("format_block_k", &format_block_k);
 }

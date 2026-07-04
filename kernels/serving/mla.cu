@@ -1,242 +1,6 @@
-// DeepSeek MLA decode (paged, MQA latent cache), CUDA/SM86 port of ThunderMittens
-// kernels/mla core: mla_q_norm_rope (GPT-J interleaved RoPE, optional RMSNorm),
-// mla_kv_insert_fp8 (V4 packed cache: 448 NoPE -> e4m3 with per-64 UE8M0 scales,
-// 64 RoPE bf16; 576B data + 8B scale rows), mla_decode (bf16 absorb path:
-// QK=LATENT+ROPE dot, LATENT-only accumulate), mla_decode_fp8 (dequant-on-read).
-// Partitioned + sparse variants and the bf16 insert are the follow-up; the
-// D=512 v2 reducer already exists in paged_attn_v2.cu.
-//
-// Build:
-//   /usr/local/cuda/bin/nvcc mla.cu -std=c++20 -O2 -DKITTENS_SM86 \
-//     -gencode arch=compute_86,code=sm_86 -I../quant -o mla.out
-#include "quant_formats.cuh"   // tmq::e4m3_decode
-#include <cuda_bf16.h>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <vector>
-#include <cmath>
-
-using bf16 = __nv_bfloat16;
-
-namespace tms {
-
-__device__ __forceinline__ float warp_sum(float v) {
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
-    return v;
-}
-
-// float -> e4m3 RNE encode (same as quant_rt's, local copy to keep this file standalone)
-__device__ __forceinline__ uint8_t e4m3_encode(float x) {
-    const unsigned sign = (x < 0.0f) ? 0x80u : 0x00u;
-    float a = fabsf(x);
-    if (!(a < 448.0f)) return uint8_t(sign | 0x7Eu);
-    if (a < 0.0009765625f) return uint8_t(sign | unsigned(int(rintf(a * 512.0f))));
-    int e; frexpf(a, &e);
-    const int E = e - 1;
-    if (E < -6) {
-        int mant = int(rintf(a * 512.0f));
-        if (mant >= 8) return uint8_t(sign | (1u << 3));
-        return uint8_t(sign | unsigned(mant));
-    }
-    const float two_m = a / exp2f(float(E));
-    int mant = int(rintf((two_m - 1.0f) * 8.0f));
-    int exp = E + 7;
-    if (mant >= 8) { mant = 0; exp += 1; }
-    if (exp > 15 || (exp == 15 && mant > 6)) return uint8_t(sign | 0x7Eu);
-    return uint8_t(sign | (unsigned(exp) << 3) | unsigned(mant));
-}
-
-// ---- fused Q path: optional RMSNorm over full head dim + GPT-J interleaved RoPE on the
-// last rope_dim dims. One warp per (token, head); lane owns D/32 CONTIGUOUS elements so
-// every interleaved pair lives in one lane. norm_mode: 0 none, 1 rms, 2 rms*weight. ----
-template <int D>
-__global__ void mla_q_norm_rope(const bf16* q, const bf16* cosb, const bf16* sinb,
-                                const int* positions, bf16* out, int num_heads,
-                                int nope_dim, int rope_dim, int norm_mode, float eps,
-                                const bf16* norm_weight) {
-    static_assert(D % 64 == 0, "head_dim must be divisible by 64");
-    constexpr int PER_LANE = D / 32;
-    const int row = blockIdx.x;                  // (token, head)
-    const int token = row / num_heads;
-    const int lane = threadIdx.x;
-    const int pos = positions[token];
-    const int rope_half = rope_dim / 2;
-    const int64_t base = int64_t(row) * D + lane * PER_LANE;
-
-    float rms = 1.0f;
-    if (norm_mode != 0) {
-        float ss = 0.0f;
-        #pragma unroll
-        for (int k = 0; k < PER_LANE; k++) { const float v = float(q[base + k]); ss += v * v; }
-        ss = warp_sum(ss);
-        rms = rsqrtf(ss / float(D) + eps);
-    }
-    const int64_t wbase = int64_t(lane) * PER_LANE;
-    const int64_t csbase = int64_t(pos) * rope_half;
-    #pragma unroll
-    for (int k = 0; k < PER_LANE; k += 2) {
-        const int g0 = lane * PER_LANE + k;      // even global index (pair start)
-        float v0 = float(q[base + k]) * rms;
-        float v1 = float(q[base + k + 1]) * rms;
-        if (norm_mode == 2) {
-            v0 *= float(norm_weight[wbase + k]);
-            v1 *= float(norm_weight[wbase + k + 1]);
-        }
-        if (g0 >= nope_dim) {                    // interleaved rotate within the pair
-            const int p = (g0 - nope_dim) / 2;
-            const float c = float(cosb[csbase + p]), s = float(sinb[csbase + p]);
-            const float r0 = v0 * c - v1 * s, r1 = v0 * s + v1 * c;
-            v0 = r0; v1 = r1;
-        }
-        out[base + k] = bf16(v0);
-        out[base + k + 1] = bf16(v1);
-    }
-}
-
-// ---- V4 packed insert: kv (T, 512) -> data_cache (nb, bs, 576) + scale_cache (nb, bs, 8).
-// NoPE [0,448): e4m3 with per-64-elem UE8M0 power-of-2 scale; RoPE [448,512): GPT-J
-// interleaved rotate, stored bf16. Lane owns 16 contiguous elems; 4 lanes = one 64-block. ----
-__global__ void mla_kv_insert_fp8(const bf16* kv, const bf16* cosb, const bf16* sinb,
-                                  const int* positions, const int64_t* slot_mapping,
-                                  uint8_t* data_cache, uint8_t* scale_cache, int block_size) {
-    constexpr int LAT = 512, NOPE = 448, PER_LANE = 16, NOPE_LANES = NOPE / PER_LANE;  // 28
-    const int token = blockIdx.x, lane = threadIdx.x;
-    const int64_t slot = slot_mapping[token];
-    if (slot < 0) return;
-    const int64_t dslot = (slot / block_size) * block_size + slot % block_size;
-    const int64_t dst_data = dslot * 576, dst_scale = dslot * 8;
-    const int pos = positions[token];
-    const int64_t kbase = int64_t(token) * LAT + lane * PER_LANE;
-
-    float v[PER_LANE];
-    #pragma unroll
-    for (int k = 0; k < PER_LANE; k++) v[k] = float(kv[kbase + k]);
-
-    float amax = 0.0f;
-    #pragma unroll
-    for (int k = 0; k < PER_LANE; k++) amax = fmaxf(amax, fabsf(v[k]));
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
-    const float exponent = ceilf(log2f(fmaxf(amax, 1e-4f) / 448.0f));
-    const float inv_scale = exp2f(-exponent);
-
-    if (lane < NOPE_LANES) {
-        #pragma unroll
-        for (int k = 0; k < PER_LANE; k++)
-            data_cache[dst_data + lane * PER_LANE + k] = e4m3_encode(v[k] * inv_scale);
-        if ((lane & 3) == 0) {
-            const int e = min(max(int(exponent) + 127, 0), 255);
-            scale_cache[dst_scale + lane / 4] = uint8_t(e);
-        }
-    } else {
-        const int rl = (lane - NOPE_LANES) * PER_LANE;   // rope-local start: 0,16,32,48
-        bf16* rope_out = reinterpret_cast<bf16*>(data_cache + dst_data + NOPE);
-        #pragma unroll
-        for (int j = 0; j < PER_LANE; j += 2) {
-            const int p = (rl + j) / 2;
-            const float c = float(cosb[int64_t(pos) * 32 + p]);
-            const float s = float(sinb[int64_t(pos) * 32 + p]);
-            rope_out[rl + j]     = bf16(v[j] * c - v[j + 1] * s);
-            rope_out[rl + j + 1] = bf16(v[j] * s + v[j + 1] * c);
-        }
-    }
-    if (lane == 0) scale_cache[dst_scale + 7] = 0;
-}
-
-// ---- bf16 absorb-path decode: score over QK=LATENT+ROPE, accumulate over LATENT only ----
-template <int LATENT, int ROPE>
-__global__ void mla_decode(const bf16* q, const bf16* kv_cache, const int* block_table,
-                           const int* context_lens, bf16* out,
-                           int block_size, int bt_stride, float scale, int num_heads) {
-    constexpr int QK = LATENT + ROPE, VQK = QK / 32, VAV = LATENT / 32;
-    const int head = blockIdx.x, batch = blockIdx.y, lane = threadIdx.x;
-    const int context_len = context_lens[batch];
-    const int64_t q_base = (int64_t(batch) * num_heads + head) * QK;
-
-    float qv[VQK], acc[VAV];
-    #pragma unroll
-    for (int i = 0; i < VQK; i++) qv[i] = float(q[q_base + lane + 32 * i]);
-    #pragma unroll
-    for (int i = 0; i < VAV; i++) acc[i] = 0.0f;
-    float m = -3.4028234663852886e38f, l = 0.0f;
-
-    for (int t = 0; t < context_len; t++) {
-        const int col = t / block_size, slot = t - col * block_size;
-        const int block = block_table[batch * bt_stride + col];
-        if (block < 0) continue;
-        const int64_t base = (int64_t(block) * block_size + slot) * QK;   // MQA: no head axis
-        float partial = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < VQK; i++) partial += qv[i] * float(kv_cache[base + lane + 32 * i]);
-        const float score = warp_sum(partial) * scale;
-        const float nm = fmaxf(m, score);
-        const float alpha = (l == 0.0f) ? 0.0f : expf(m - nm);
-        const float beta = expf(score - nm);
-        #pragma unroll
-        for (int i = 0; i < VAV; i++)
-            acc[i] = acc[i] * alpha + beta * float(kv_cache[base + lane + 32 * i]);
-        l = l * alpha + beta;
-        m = nm;
-    }
-    const int64_t out_base = (int64_t(batch) * num_heads + head) * LATENT;
-    #pragma unroll
-    for (int i = 0; i < VAV; i++)
-        out[out_base + lane + 32 * i] = (l == 0.0f) ? bf16(0.0f) : bf16(acc[i] / l);
-}
-
-// ---- V4 fp8 decode: dequant-on-read over the packed 576/8 cache, score+value over 512 ----
-__global__ void mla_decode_fp8(const bf16* q, const uint8_t* data_cache, const uint8_t* scale_cache,
-                               const int* block_table, const int* context_lens, bf16* out,
-                               int block_size, int bt_stride, float scale, int num_heads) {
-    constexpr int LATENT = 512, NOPE = 448, VPL = LATENT / 32;
-    const int head = blockIdx.x, batch = blockIdx.y, lane = threadIdx.x;
-    const int context_len = context_lens[batch];
-    const int64_t q_base = (int64_t(batch) * num_heads + head) * LATENT;
-
-    float qv[VPL], acc[VPL];
-    #pragma unroll
-    for (int i = 0; i < VPL; i++) { qv[i] = float(q[q_base + lane + 32 * i]); acc[i] = 0.0f; }
-    float m = -3.4028234663852886e38f, l = 0.0f;
-
-    for (int t = 0; t < context_len; t++) {
-        const int col = t / block_size, slot = t - col * block_size;
-        const int block = block_table[batch * bt_stride + col];
-        if (block < 0) continue;
-        const int64_t dslot = int64_t(block) * block_size + slot;
-        const int64_t dbase = dslot * 576, sbase = dslot * 8;
-        const bf16* rope = reinterpret_cast<const bf16*>(data_cache + dbase + NOPE);
-
-        float lat[VPL], partial = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < VPL; i++) {
-            const int d = lane + 32 * i;
-            if (d < NOPE) {
-                const int e = int(scale_cache[sbase + d / 64]);
-                lat[i] = tmq::e4m3_decode(data_cache[dbase + d]) * exp2f(float(e - 127));
-            } else {
-                lat[i] = float(rope[d - NOPE]);
-            }
-            partial += qv[i] * lat[i];
-        }
-        const float score = warp_sum(partial) * scale;
-        const float nm = fmaxf(m, score);
-        const float alpha = (l == 0.0f) ? 0.0f : expf(m - nm);
-        const float beta = expf(score - nm);
-        #pragma unroll
-        for (int i = 0; i < VPL; i++) acc[i] = acc[i] * alpha + beta * lat[i];
-        l = l * alpha + beta;
-        m = nm;
-    }
-    const int64_t out_base = (int64_t(batch) * num_heads + head) * LATENT;
-    #pragma unroll
-    for (int i = 0; i < VPL; i++)
-        out[out_base + lane + 32 * i] = (l == 0.0f) ? bf16(0.0f) : bf16(acc[i] / l);
-}
-
-}  // namespace tms
-
+// Harness for mla kernels (kernels live in mla_kernels.cuh).
+#include "mla_kernels.cuh"
+#include "paged_attn_v2_kernels.cuh"   // paged_attention_reduce<bf16,512>
 // ============================== test harness ==============================
 using namespace tms;
 static float frand() { return (rand() % 20000 - 10000) / 10000.0f; }
@@ -446,6 +210,293 @@ int main() {
         rc |= !(maxd < 6e-3);
         cudaFree(ddata); cudaFree(dscale); cudaFree(dkv); cudaFree(dcb); cudaFree(dsb);
         cudaFree(dpos); cudaFree(dslot); cudaFree(dq); cudaFree(dout); cudaFree(dbt); cudaFree(dctx);
+    }
+    // ---- 4. bf16 mla_kv_insert (norm modes 0/2, neg slot skip) vs fp64 replay ----
+    {
+        const int T_ = 37, LAT = 512, ROPE = 64, RH = 32, BS = 16, PMAX = 64;
+        const int nslots = (T_ / BS + 2) * BS;
+        std::vector<bf16> kvc(size_t(T_) * LAT), kpe(size_t(T_) * ROPE), W(LAT),
+                          cb(size_t(PMAX) * RH), sb(cb.size());
+        std::vector<int> pos(T_);
+        std::vector<int64_t> slots(T_);
+        for (auto& x : kvc) x = bf16(frand());
+        for (auto& x : kpe) x = bf16(frand());
+        for (auto& x : W) x = bf16(frand() * 0.5f + 1.0f);
+        for (int p = 0; p < PMAX; p++) for (int i = 0; i < RH; i++) {
+            const double th = p / pow(10000.0, double(i) / RH);
+            cb[size_t(p) * RH + i] = bf16(float(cos(th)));
+            sb[size_t(p) * RH + i] = bf16(float(sin(th)));
+        }
+        for (int t = 0; t < T_; t++) {
+            pos[t] = (t * 3) % PMAX;
+            slots[t] = (t == 5) ? -1 : (t * 7) % nslots;    // one padding token
+        }
+        // distinct slots except the -1 (t*7 mod nslots collides only if nslots%7==0; 48? T_=37, nslots=48: 7*t mod 48 cycles length 48 -> distinct)
+        bf16 *dkvc, *dkpe, *dW, *dcb, *dsb, *dcache; int* dpos; int64_t* dslot;
+        const size_t cache_n = size_t(nslots) * (LAT + ROPE);
+        cudaMalloc(&dkvc, kvc.size() * 2); cudaMalloc(&dkpe, kpe.size() * 2);
+        cudaMalloc(&dW, LAT * 2); cudaMalloc(&dcb, cb.size() * 2); cudaMalloc(&dsb, sb.size() * 2);
+        cudaMalloc(&dcache, cache_n * 2); cudaMalloc(&dpos, T_ * 4); cudaMalloc(&dslot, T_ * 8);
+        cudaMemcpy(dkvc, kvc.data(), kvc.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(dkpe, kpe.data(), kpe.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(dW, W.data(), LAT * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(dcb, cb.data(), cb.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(dsb, sb.data(), sb.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(dpos, pos.data(), T_ * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dslot, slots.data(), T_ * 8, cudaMemcpyHostToDevice);
+        for (int mode : {0, 2}) {
+            const bf16 sentinel = bf16(-7.5f);
+            std::vector<bf16> init(cache_n, sentinel);
+            cudaMemcpy(dcache, init.data(), cache_n * 2, cudaMemcpyHostToDevice);
+            mla_kv_insert<512><<<T_, 32>>>(dkvc, dkpe, dcb, dsb, dpos, dslot, dcache,
+                                           BS, ROPE, mode, 1e-6f, dW);
+            cudaDeviceSynchronize();
+            std::vector<bf16> got(cache_n);
+            cudaMemcpy(got.data(), dcache, cache_n * 2, cudaMemcpyDeviceToHost);
+            double maxd = 0;
+            bool skip_ok = true;
+            std::vector<bool> written(nslots, false);
+            for (int t = 0; t < T_; t++) {
+                if (slots[t] < 0) continue;
+                written[slots[t]] = true;
+                const size_t dst = size_t(slots[t]) * (LAT + ROPE);
+                double ss = 0;
+                for (int d = 0; d < LAT; d++) { const double v = b2d(kvc[size_t(t) * LAT + d]); ss += v * v; }
+                const double rms = mode ? 1.0 / sqrt(ss / LAT + 1e-6) : 1.0;
+                for (int d = 0; d < LAT; d++) {
+                    double v = b2d(kvc[size_t(t) * LAT + d]) * rms;
+                    if (mode == 2) v *= b2d(W[d]);
+                    maxd = std::max(maxd, std::abs(b2d(got[dst + d]) - v));
+                }
+                for (int i = 0; i < RH; i++) {
+                    const double e = b2d(kpe[size_t(t) * ROPE + 2 * i]);
+                    const double o = b2d(kpe[size_t(t) * ROPE + 2 * i + 1]);
+                    const double c = b2d(cb[size_t(pos[t]) * RH + i]);
+                    const double s = b2d(sb[size_t(pos[t]) * RH + i]);
+                    maxd = std::max(maxd, std::abs(b2d(got[dst + LAT + 2 * i]) - (e * c - o * s)));
+                    maxd = std::max(maxd, std::abs(b2d(got[dst + LAT + 2 * i + 1]) - (e * s + o * c)));
+                }
+            }
+            for (int s = 0; s < nslots; s++) {              // untouched slots keep the sentinel
+                if (written[s]) continue;
+                for (int d = 0; d < LAT + ROPE; d += 97)
+                    skip_ok &= b2d(got[size_t(s) * (LAT + ROPE) + d]) == b2d(sentinel);
+            }
+            printf("mla_kv_insert<512> bf16 mode=%d max diff %.5f skip=%s (%s)\n", mode, maxd,
+                   skip_ok ? "ok" : "BAD", (maxd < 2e-2 && skip_ok) ? "PASS" : "FAIL");
+            rc |= !(maxd < 2e-2 && skip_ok);
+        }
+        cudaFree(dkvc); cudaFree(dkpe); cudaFree(dW); cudaFree(dcb); cudaFree(dsb);
+        cudaFree(dcache); cudaFree(dpos); cudaFree(dslot);
+    }
+
+    // ---- 5. partitioned + sparse decode variants vs fp64 oracles ----
+    {
+        const int B = 2, H = 4, BS = 16, MAXB = 12, LAT = 512, NOPE = 448, ROPE = 64, QK = LAT + ROPE;
+        const int ctx[B] = {49, 90};
+        const int nb = B * MAXB + 1;
+        std::vector<int> bt(B * MAXB, -1);
+        int nxt = 1;
+        for (int b = 0; b < B; b++) for (int c = 0; c * BS < ctx[b]; c++) bt[b * MAXB + c] = nxt++;
+
+        // fp8 cache: fill via random kv (identity rope: pos 0) using the proven insert
+        const int T_ = ctx[0] + ctx[1];
+        std::vector<bf16> kv(size_t(T_) * LAT), cb(size_t(64) * 32), sb(cb.size());
+        std::vector<int> pos(T_, 0);
+        std::vector<int64_t> slots(T_);
+        for (auto& x : kv) x = bf16(frand() * 0.4f);
+        for (int p = 0; p < 64; p++) for (int i = 0; i < 32; i++) {
+            const double th = p / pow(10000.0, i / 32.0);
+            cb[size_t(p) * 32 + i] = bf16(float(cos(th)));
+            sb[size_t(p) * 32 + i] = bf16(float(sin(th)));
+        }
+        for (int b = 0, i = 0; b < B; b++) for (int t = 0; t < ctx[b]; t++, i++) {
+            pos[i] = t % 64;
+            slots[i] = int64_t(bt[b * MAXB + t / BS]) * BS + t % BS;
+        }
+        uint8_t *ddata, *dscale; bf16 *dkv, *dcb, *dsb; int* dpos; int64_t* dslot;
+        cudaMalloc(&ddata, size_t(nb) * BS * 576); cudaMalloc(&dscale, size_t(nb) * BS * 8);
+        cudaMalloc(&dkv, kv.size() * 2); cudaMalloc(&dcb, cb.size() * 2); cudaMalloc(&dsb, sb.size() * 2);
+        cudaMalloc(&dpos, T_ * 4); cudaMalloc(&dslot, T_ * 8);
+        cudaMemcpy(dkv, kv.data(), kv.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(dcb, cb.data(), cb.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(dsb, sb.data(), sb.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(dpos, pos.data(), T_ * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dslot, slots.data(), T_ * 8, cudaMemcpyHostToDevice);
+        mla_kv_insert_fp8<<<T_, 32>>>(dkv, dcb, dsb, dpos, dslot, ddata, dscale, BS);
+        cudaDeviceSynchronize();
+        std::vector<uint8_t> data(size_t(nb) * BS * 576), scl(size_t(nb) * BS * 8);
+        cudaMemcpy(data.data(), ddata, data.size(), cudaMemcpyDeviceToHost);
+        cudaMemcpy(scl.data(), dscale, scl.size(), cudaMemcpyDeviceToHost);
+        auto dec = [](uint8_t v) {
+            float mag;
+            if (v & 0x78) { int e = (v >> 3) & 0xF, mm = v & 7; mag = std::ldexp(1.0f + mm / 8.0f, e - 7); }
+            else mag = float(v & 7) * 0.001953125f;
+            return double((v & 0x80) ? -mag : mag);
+        };
+        std::vector<double> dcache(size_t(nb) * BS * LAT, 0.0);
+        for (size_t s = 0; s < size_t(nb) * BS; s++) {
+            for (int d = 0; d < NOPE; d++)
+                dcache[s * LAT + d] = dec(data[s * 576 + d]) * std::ldexp(1.0, int(scl[s * 8 + d / 64]) - 127);
+            const bf16* rope = reinterpret_cast<const bf16*>(&data[s * 576 + NOPE]);
+            for (int d = NOPE; d < LAT; d++) dcache[s * LAT + d] = b2d(rope[d - NOPE]);
+        }
+
+        std::vector<bf16> q(size_t(B) * H * LAT);
+        for (auto& x : q) x = bf16(frand() * 0.3f);
+        bf16 *dq, *dout; int *dbt, *dctx;
+        cudaMalloc(&dq, q.size() * 2); cudaMalloc(&dout, q.size() * 2);
+        cudaMalloc(&dbt, bt.size() * 4); cudaMalloc(&dctx, B * 4);
+        cudaMemcpy(dq, q.data(), q.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(dbt, bt.data(), bt.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dctx, ctx, B * 4, cudaMemcpyHostToDevice);
+        const float scale = 1.0f / sqrtf(float(LAT));
+
+        // fp64 oracle over an arbitrary token set per (b,h)
+        auto oracle = [&](int b, int h, const std::vector<int>& toks, std::vector<double>& o) {
+            std::vector<double> sc; std::vector<size_t> ss_;
+            for (int t : toks) {
+                const int blk = bt[b * MAXB + t / BS];
+                if (blk < 0) continue;
+                const size_t s = size_t(blk) * BS + t % BS;
+                double sv = 0;
+                for (int d = 0; d < LAT; d++)
+                    sv += b2d(q[(size_t(b) * H + h) * LAT + d]) * dcache[s * LAT + d];
+                sc.push_back(sv * scale); ss_.push_back(s);
+            }
+            double mx = -1e300;
+            for (double s : sc) mx = std::max(mx, s);
+            o.assign(LAT, 0.0);
+            double Z = 0;
+            for (size_t i = 0; i < sc.size(); i++) {
+                const double w = exp(sc[i] - mx);
+                for (int d = 0; d < LAT; d++) o[d] += w * dcache[ss_[i] * LAT + d];
+                Z += w;
+            }
+            for (int d = 0; d < LAT; d++) o[d] /= Z;
+        };
+
+        // sparse index lists: every 3rd token + one -1 padding entry
+        const int max_topk = 40;
+        std::vector<int> idx(B * max_topk, -1), tlen(B);
+        std::vector<std::vector<int>> sel(B);
+        for (int b = 0; b < B; b++) {
+            int n = 0;
+            for (int t = 0; t < ctx[b] && n < max_topk - 1; t += 3) { idx[b * max_topk + n++] = t; sel[b].push_back(t); }
+            idx[b * max_topk + n++] = -1;                   // skipped entry inside the list
+            tlen[b] = n;
+        }
+        int *didx, *dtlen;
+        cudaMalloc(&didx, idx.size() * 4); cudaMalloc(&dtlen, B * 4);
+        cudaMemcpy(didx, idx.data(), idx.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dtlen, tlen.data(), B * 4, cudaMemcpyHostToDevice);
+
+        // (a) fp8 sparse, full
+        mla_decode_fp8_v<true, false><<<dim3(H, B), 32>>>(dq, ddata, dscale, dbt, nullptr,
+            didx, dtlen, max_topk, dout, nullptr, nullptr, nullptr, BS, MAXB, scale, H, 1, 0);
+        cudaDeviceSynchronize();
+        std::vector<bf16> got(q.size());
+        cudaMemcpy(got.data(), dout, q.size() * 2, cudaMemcpyDeviceToHost);
+        double maxd = 0;
+        for (int b = 0; b < B; b++) for (int h = 0; h < H; h++) {
+            std::vector<double> o;
+            oracle(b, h, sel[b], o);
+            for (int d = 0; d < LAT; d++)
+                maxd = std::max(maxd, std::abs(b2d(got[(size_t(b) * H + h) * LAT + d]) - o[d]));
+        }
+        printf("mla_decode_fp8_sparse         max diff %.5f (%s)\n", maxd, maxd < 6e-3 ? "PASS" : "FAIL");
+        rc |= !(maxd < 6e-3);
+
+        // (b) fp8 dense partition + reduce
+        const int PS = 32, P = (90 + PS - 1) / PS;
+        float *dtmp, *dml, *des;
+        cudaMalloc(&dtmp, size_t(B) * H * P * LAT * 4);
+        cudaMalloc(&dml, size_t(B) * H * P * 4); cudaMalloc(&des, size_t(B) * H * P * 4);
+        mla_decode_fp8_v<false, true><<<dim3(H, B, P), 32>>>(dq, ddata, dscale, dbt, dctx,
+            nullptr, nullptr, 0, nullptr, dtmp, dml, des, BS, MAXB, scale, H, P, PS);
+        paged_attention_reduce<bf16, 512><<<dim3(H, B), 32>>>(dtmp, dml, des, dout, H, P);
+        cudaDeviceSynchronize();
+        cudaMemcpy(got.data(), dout, q.size() * 2, cudaMemcpyDeviceToHost);
+        maxd = 0;
+        for (int b = 0; b < B; b++) for (int h = 0; h < H; h++) {
+            std::vector<int> all(ctx[b]);
+            for (int t = 0; t < ctx[b]; t++) all[t] = t;
+            std::vector<double> o;
+            oracle(b, h, all, o);
+            for (int d = 0; d < LAT; d++)
+                maxd = std::max(maxd, std::abs(b2d(got[(size_t(b) * H + h) * LAT + d]) - o[d]));
+        }
+        printf("mla_decode_fp8_partition+red  max diff %.5f (%s)\n", maxd, maxd < 6e-3 ? "PASS" : "FAIL");
+        rc |= !(maxd < 6e-3);
+
+        // (c) fp8 sparse partition (PS 8 over the index list) + reduce
+        const int PS2 = 8, P2 = (max_topk + PS2 - 1) / PS2;
+        float *dtmp2, *dml2, *des2;
+        cudaMalloc(&dtmp2, size_t(B) * H * P2 * LAT * 4);
+        cudaMalloc(&dml2, size_t(B) * H * P2 * 4); cudaMalloc(&des2, size_t(B) * H * P2 * 4);
+        mla_decode_fp8_v<true, true><<<dim3(H, B, P2), 32>>>(dq, ddata, dscale, dbt, nullptr,
+            didx, dtlen, max_topk, nullptr, dtmp2, dml2, des2, BS, MAXB, scale, H, P2, PS2);
+        paged_attention_reduce<bf16, 512><<<dim3(H, B), 32>>>(dtmp2, dml2, des2, dout, H, P2);
+        cudaDeviceSynchronize();
+        cudaMemcpy(got.data(), dout, q.size() * 2, cudaMemcpyDeviceToHost);
+        maxd = 0;
+        for (int b = 0; b < B; b++) for (int h = 0; h < H; h++) {
+            std::vector<double> o;
+            oracle(b, h, sel[b], o);
+            for (int d = 0; d < LAT; d++)
+                maxd = std::max(maxd, std::abs(b2d(got[(size_t(b) * H + h) * LAT + d]) - o[d]));
+        }
+        printf("mla_decode_fp8_sparse_part+red max diff %.5f (%s)\n", maxd, maxd < 6e-3 ? "PASS" : "FAIL");
+        rc |= !(maxd < 6e-3);
+
+        // (d) bf16 partitioned decode + reduce vs the serial bf16 kernel's oracle path
+        {
+            std::vector<bf16> cache(size_t(nb) * BS * QK), qq(size_t(B) * H * QK);
+            for (auto& x : cache) x = bf16(frand() * 0.2f);
+            for (auto& x : qq) x = bf16(frand() * 0.3f);
+            bf16 *dc_, *dq2, *dout2;
+            cudaMalloc(&dc_, cache.size() * 2); cudaMalloc(&dq2, qq.size() * 2);
+            cudaMalloc(&dout2, size_t(B) * H * LAT * 2);
+            cudaMemcpy(dc_, cache.data(), cache.size() * 2, cudaMemcpyHostToDevice);
+            cudaMemcpy(dq2, qq.data(), qq.size() * 2, cudaMemcpyHostToDevice);
+            const float sc2 = 1.0f / sqrtf(float(QK));
+            mla_decode_partition<512, 64><<<dim3(H, B, P), 32>>>(dq2, dc_, dbt, dctx,
+                dtmp, dml, des, BS, MAXB, sc2, H, P, PS);
+            paged_attention_reduce<bf16, 512><<<dim3(H, B), 32>>>(dtmp, dml, des, dout2, H, P);
+            cudaDeviceSynchronize();
+            std::vector<bf16> got2(size_t(B) * H * LAT);
+            cudaMemcpy(got2.data(), dout2, got2.size() * 2, cudaMemcpyDeviceToHost);
+            double md2 = 0;
+            for (int b = 0; b < B; b++) for (int h = 0; h < H; h++) {
+                std::vector<double> sc; std::vector<int64_t> bases;
+                for (int t = 0; t < ctx[b]; t++) {
+                    const int blk = bt[b * MAXB + t / BS];
+                    if (blk < 0) continue;
+                    const int64_t base = (int64_t(blk) * BS + t % BS) * QK;
+                    double s = 0;
+                    for (int d = 0; d < QK; d++)
+                        s += b2d(qq[(size_t(b) * H + h) * QK + d]) * b2d(cache[base + d]);
+                    sc.push_back(s * sc2); bases.push_back(base);
+                }
+                double mx = -1e300;
+                for (double s : sc) mx = std::max(mx, s);
+                std::vector<double> o(LAT, 0.0); double Z = 0;
+                for (size_t i = 0; i < sc.size(); i++) {
+                    const double w = exp(sc[i] - mx);
+                    for (int d = 0; d < LAT; d++) o[d] += w * b2d(cache[bases[i] + d]);
+                    Z += w;
+                }
+                for (int d = 0; d < LAT; d++)
+                    md2 = std::max(md2, std::abs(b2d(got2[(size_t(b) * H + h) * LAT + d]) - o[d] / Z));
+            }
+            printf("mla_decode_partition bf16+red max diff %.5f (%s)\n", md2, md2 < 6e-3 ? "PASS" : "FAIL");
+            rc |= !(md2 < 6e-3);
+            cudaFree(dc_); cudaFree(dq2); cudaFree(dout2);
+        }
+        cudaFree(ddata); cudaFree(dscale); cudaFree(dkv); cudaFree(dcb); cudaFree(dsb);
+        cudaFree(dpos); cudaFree(dslot); cudaFree(dq); cudaFree(dout); cudaFree(dbt); cudaFree(dctx);
+        cudaFree(didx); cudaFree(dtlen); cudaFree(dtmp); cudaFree(dml); cudaFree(des);
+        cudaFree(dtmp2); cudaFree(dml2); cudaFree(des2);
     }
     return rc;
 }

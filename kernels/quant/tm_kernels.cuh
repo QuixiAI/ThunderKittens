@@ -8,6 +8,7 @@
 #pragma once
 #include "tm_qmm.cuh"
 #include "tm_rng.cuh"
+#include "../serving/tm_warp.cuh"
 #include <cuda_fp16.h>
 
 #define LMH_NEG_INF_DEF
@@ -112,6 +113,96 @@ __global__ void dequant_to_fp16(half* out, const uint8_t* Wq, int N, int K) {
     int row = idx / K, col = idx % K;
     const uint8_t* base = Wq + (size_t(row) * (K / FMT::block_k) + col / FMT::block_k) * FMT::block_bytes;
     out[idx] = __float2half(FMT::dequant(base, col % FMT::block_k));
+}
+
+// ---- qgemm_actorder: GPTQ act-order with an IN-KERNEL g_idx gather (TM
+// qgemm.metal 160-212). The weight is quantized in PERMUTED K order (groups
+// contiguous); the X columns are gathered by perm during the fragment fill —
+// no materialized permuted-X copy: Y[m,n] = sum_i deq(Wq)[n,i] * X[m, perm[i]].
+// Mirrors qgemm otherwise (warp per 16x16 tile, mma_ABt fragment halves). ----
+template<typename FMT>
+__global__ void qgemm_actorder(float* Y, const half* X, const uint8_t* Wq, const int* perm,
+                               int M, int N, int K) {
+    const int n0 = blockIdx.x * 16;
+    const int m0 = blockIdx.y * 16;
+    const int bpr = K / FMT::block_k;
+    const int lane = threadIdx.x & 31;
+
+    float acc0[4] = {0, 0, 0, 0};
+    float acc1[4] = {0, 0, 0, 0};
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        half2 a[4], b[4];
+        // X fragment with the K-axis gather (element loads; perm cols non-contiguous)
+        const int r = m0 + lane / 4;
+        const int c = k0 + (lane % 4) * 2;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const int rr = r + (k % 2) * 8;
+            const int cc = c + (k / 2) * 8;
+            a[k] = __halves2half2(X[size_t(rr) * K + perm[cc]],
+                                  X[size_t(rr) * K + perm[cc + 1]]);
+        }
+        load_wfrag<FMT>(b, Wq, bpr, n0, k0);
+        half2 b0[2] = {b[0], b[2]};
+        half2 b1[2] = {b[1], b[3]};
+        mma16816(acc0, a, b0);
+        mma16816(acc1, a, b1);
+    }
+    const int r = m0 + lane / 4, c0 = n0 + (lane % 4) * 2;
+    if (r < M) {
+        Y[size_t(r) * N + c0]     = acc0[0];
+        Y[size_t(r) * N + c0 + 1] = acc0[1];
+        Y[size_t(r) * N + c0 + 8]     = acc1[0];
+        Y[size_t(r) * N + c0 + 8 + 1] = acc1[1];
+    }
+    if (r + 8 < M) {
+        Y[size_t(r + 8) * N + c0]     = acc0[2];
+        Y[size_t(r + 8) * N + c0 + 1] = acc0[3];
+        Y[size_t(r + 8) * N + c0 + 8]     = acc1[2];
+        Y[size_t(r + 8) * N + c0 + 8 + 1] = acc1[3];
+    }
+}
+
+// ---- qgemm_blockscale: fp8_raw codes-only weights scaled by a SEPARATE
+// (N/128, K/128) fp16 per-tile scale buffer (compressed-tensors fp8_block
+// without per-row replication; TM qgemm.metal 214-252). A 16x16 fragment
+// never straddles a 128-tile, so one scalar scale per k-step. ----
+template<typename FMT>
+__global__ void qgemm_blockscale(float* Y, const half* X, const uint8_t* Wq,
+                                 const half* scale2d, int M, int N, int K) {
+    const int n0 = blockIdx.x * 16;
+    const int m0 = blockIdx.y * 16;
+    const int bpr = K / FMT::block_k;
+    const int KT = K / 128;
+    const int lane = threadIdx.x & 31;
+
+    float acc0[4] = {0, 0, 0, 0};
+    float acc1[4] = {0, 0, 0, 0};
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        half2 a[4], b[4];
+        load_xfrag(a, X, K, m0, k0);
+        load_wfrag<FMT>(b, Wq, bpr, n0, k0);
+        const half2 sc = __half2half2(scale2d[(n0 / 128) * KT + (k0 / 128)]);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) b[k] = __hmul2(b[k], sc);
+        half2 b0[2] = {b[0], b[2]};
+        half2 b1[2] = {b[1], b[3]};
+        mma16816(acc0, a, b0);
+        mma16816(acc1, a, b1);
+    }
+    const int r = m0 + lane / 4, c0 = n0 + (lane % 4) * 2;
+    if (r < M) {
+        Y[size_t(r) * N + c0]     = acc0[0];
+        Y[size_t(r) * N + c0 + 1] = acc0[1];
+        Y[size_t(r) * N + c0 + 8]     = acc1[0];
+        Y[size_t(r) * N + c0 + 8 + 1] = acc1[1];
+    }
+    if (r + 8 < M) {
+        Y[size_t(r + 8) * N + c0]     = acc0[2];
+        Y[size_t(r + 8) * N + c0 + 1] = acc0[3];
+        Y[size_t(r + 8) * N + c0 + 8]     = acc1[2];
+        Y[size_t(r + 8) * N + c0 + 8 + 1] = acc1[3];
+    }
 }
 
 
@@ -409,5 +500,196 @@ __global__ void lm_head_argcat_reduce(const float* part_val, const int* part_id,
     if (lane == 0) out_idx[t] = bi;
 }
 
+// ============================================================================
+// Fused LM-head top-k / top-p (nucleus) sampling — TM lm_head.metal 180-462.
+// partials: warp per (vocab tile, token); each lane collects its owned logits
+// into per-lane local slots, Family-B masked_topk_local merges the tile's
+// top-k winners into (part_val, part_id). Top-p partials ALSO emit a per-tile
+// tempered logsumexp so the reduce can build the TRUE full-vocab normalizer
+// (exact nucleus cutoff, not the pool approximation).
+// reduce: warp per token — Family-A masked_topk over the merged pool, then
+// Gumbel-max (top-k) or logit-threshold bisection + Gumbel-max (top-p), noise
+// indexed by the GLOBAL vocab id so fused draws equal the unfused sampler's.
+// TILE_V <= 2048 (64 local slots per lane).
+// ============================================================================
+#define LMH_MAX_K 64
+#define LMH_MAX_PER_LANE 64
+
+// USE_LSE=1 also emits the per-tile tempered logsumexp (top-p path).
+template<int USE_LSE>
+__global__ void lm_head_topk_partials(const half* h, const half* W, float* part_val,
+                                      int* part_id, const float* bias, int V, int K,
+                                      int TILE_V, int num_vtiles, int topk, int use_bias,
+                                      float invtemp, float* part_lse) {
+    const int vtile = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    const int v0 = vtile * TILE_V, v1 = min(v0 + TILE_V, V);
+    const half* hrow = h + size_t(t) * K;
+    float mine_val[LMH_MAX_PER_LANE];
+    int   mine_id[LMH_MAX_PER_LANE];
+    bool  used[LMH_MAX_PER_LANE];
+    int   nmine = 0;
+    float lmax = LMH_NEG_INF, lsum = 0.0f;
+    for (int v = v0 + lane; v < v1; v += 32) {
+        const half* wrow = W + size_t(v) * K;
+        float acc = 0.0f;
+        for (int j = 0; j < K / 2; j++) {
+            half2 w2 = reinterpret_cast<const half2*>(wrow)[j];
+            half2 h2 = reinterpret_cast<const half2*>(hrow)[j];
+            acc += __half2float(w2.x) * __half2float(h2.x) + __half2float(w2.y) * __half2float(h2.y);
+        }
+        float ls = acc;
+        if (use_bias) ls += bias[v];
+        if (USE_LSE) {
+            const float tl = ls * invtemp;
+            if (tl > lmax) { lsum = lsum * expf(lmax - tl) + 1.0f; lmax = tl; }
+            else           { lsum += expf(tl - lmax); }
+        }
+        mine_val[nmine] = ls;
+        mine_id[nmine] = v;
+        ++nmine;
+    }
+    if (USE_LSE) {
+        const float gmax = tms::warp_max_f(lmax);
+        const float gsum = tms::warp_sum_f((lmax == LMH_NEG_INF) ? 0.0f : lsum * expf(lmax - gmax));
+        if (lane == 0)
+            part_lse[size_t(t) * num_vtiles + vtile] = (gsum > 0.0f) ? (gmax + logf(gsum)) : LMH_NEG_INF;
+    }
+    const size_t pbase = (size_t(t) * num_vtiles + vtile) * topk;
+    tms::masked_topk_local(mine_val, mine_id, used, nmine, topk, LMH_NEG_INF,
+        [&](int kk, float gbest, int gid) {
+            if (lane == 0) {
+                part_val[pbase + kk] = gbest;
+                part_id[pbase + kk] = (gbest == LMH_NEG_INF) ? -1 : gid;
+            }
+        });
+}
+
+template<typename FMT, int USE_LSE>
+__global__ void lm_head_topk_partials_q(const half* h, const uint8_t* Wq, float* part_val,
+                                        int* part_id, const float* bias, int V, int K,
+                                        int TILE_V, int num_vtiles, int topk, int use_bias,
+                                        float invtemp, float* part_lse) {
+    const int vtile = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    const int v0 = vtile * TILE_V, v1 = min(v0 + TILE_V, V);
+    const int bpr = K / FMT::block_k;
+    const half* hrow = h + size_t(t) * K;
+    float mine_val[LMH_MAX_PER_LANE];
+    int   mine_id[LMH_MAX_PER_LANE];
+    bool  used[LMH_MAX_PER_LANE];
+    int   nmine = 0;
+    float lmax = LMH_NEG_INF, lsum = 0.0f;
+    for (int v = v0 + lane; v < v1; v += 32) {
+        const uint8_t* row_base = Wq + size_t(v) * bpr * FMT::block_bytes;
+        float acc = 0.0f;
+        for (int kb = 0; kb < bpr; kb++) {
+            const uint8_t* base = row_base + size_t(kb) * FMT::block_bytes;
+            const half* xp = hrow + kb * FMT::block_k;
+            for (int c0 = 0; c0 < FMT::block_k; c0 += 8) {
+                float w[8];
+                dequant8<FMT>(base, c0, w);
+                #pragma unroll
+                for (int i = 0; i < 8; i++) acc += w[i] * __half2float(xp[c0 + i]);
+            }
+        }
+        float ls = acc;
+        if (use_bias) ls += bias[v];
+        if (USE_LSE) {
+            const float tl = ls * invtemp;
+            if (tl > lmax) { lsum = lsum * expf(lmax - tl) + 1.0f; lmax = tl; }
+            else           { lsum += expf(tl - lmax); }
+        }
+        mine_val[nmine] = ls;
+        mine_id[nmine] = v;
+        ++nmine;
+    }
+    if (USE_LSE) {
+        const float gmax = tms::warp_max_f(lmax);
+        const float gsum = tms::warp_sum_f((lmax == LMH_NEG_INF) ? 0.0f : lsum * expf(lmax - gmax));
+        if (lane == 0)
+            part_lse[size_t(t) * num_vtiles + vtile] = (gsum > 0.0f) ? (gmax + logf(gsum)) : LMH_NEG_INF;
+    }
+    const size_t pbase = (size_t(t) * num_vtiles + vtile) * topk;
+    tms::masked_topk_local(mine_val, mine_id, used, nmine, topk, LMH_NEG_INF,
+        [&](int kk, float gbest, int gid) {
+            if (lane == 0) {
+                part_val[pbase + kk] = gbest;
+                part_id[pbase + kk] = (gbest == LMH_NEG_INF) ? -1 : gid;
+            }
+        });
+}
+
+// top-k reduce: global merge of the per-tile partial winners, then Gumbel-max
+// among the k winners (tempered; noise by global vocab id).
+__global__ void lm_head_topk_reduce(const float* part_val, const int* part_id,
+                                    int* out_idx, int num_vtiles, int topk,
+                                    unsigned seed, float invtemp) {
+    const int t = blockIdx.x, lane = threadIdx.x;
+    const int ncand = num_vtiles * topk;
+    const size_t base = size_t(t) * ncand;
+    int   chosen_id[LMH_MAX_K];
+    float chosen_val[LMH_MAX_K];
+    auto cand = [&](int idx, int& id, float& v, bool& valid) {
+        id = part_id[base + idx];
+        v = part_val[base + idx];
+        valid = id >= 0;
+    };
+    tms::masked_topk(cand, ncand, topk, lane, LMH_NEG_INF, chosen_id, chosen_val);
+    float best = LMH_NEG_INF;
+    int bi = chosen_id[0];
+    for (int kk = 0; kk < topk; ++kk) {
+        if (chosen_id[kk] < 0) continue;
+        const float g = rng_gumbel(seed, unsigned(t), unsigned(chosen_id[kk]));
+        const float p = chosen_val[kk] * invtemp + g;
+        if (p > best || (p == best && chosen_id[kk] < bi)) { best = p; bi = chosen_id[kk]; }
+    }
+    if (lane == 0) out_idx[t] = bi;
+}
+
+// top-p reduce: nucleus over the merged over-selected pool with the TRUE
+// full-vocab normalizer from the per-tile lses; 32-step bisection of the
+// tempered-logit threshold, then Gumbel-max over {ls >= L}.
+__global__ void lm_head_topp_reduce(const float* part_val, const int* part_id,
+                                    int* out_idx, int num_vtiles, int topk, float p,
+                                    unsigned seed, float invtemp, const float* part_lse) {
+    const int t = blockIdx.x, lane = threadIdx.x;
+    const int ncand = num_vtiles * topk;
+    const size_t base = size_t(t) * ncand;
+    float mx = LMH_NEG_INF;
+    for (int j = lane; j < ncand; j += 32)
+        if (part_id[base + j] >= 0) mx = fmaxf(mx, part_val[base + j] * invtemp);
+    mx = tms::warp_max_f(mx);
+    const size_t lbase = size_t(t) * num_vtiles;
+    float Z = 0.0f;
+    for (int vt = lane; vt < num_vtiles; vt += 32) {
+        const float pl = part_lse[lbase + vt];
+        if (pl > LMH_NEG_INF) Z += expf(pl - mx);
+    }
+    Z = tms::warp_sum_f(Z);
+    float lo = mx - 40.0f, hi = mx;             // largest L with mass{ls>=L} >= p
+    for (int it = 0; it < 32; ++it) {
+        const float mid = 0.5f * (lo + hi);
+        float sm = 0.0f;
+        for (int j = lane; j < ncand; j += 32) {
+            const float ls = part_val[base + j] * invtemp;
+            if (part_id[base + j] >= 0 && ls >= mid) sm += expf(ls - mx);
+        }
+        sm = tms::warp_sum_f(sm) / Z;
+        if (sm >= p) lo = mid; else hi = mid;
+    }
+    const float L = lo;
+    float best = LMH_NEG_INF;
+    int bi = -1;
+    for (int j = lane; j < ncand; j += 32) {
+        const int id = part_id[base + j];
+        const float ls = part_val[base + j] * invtemp;
+        if (id < 0 || ls < L) continue;
+        const float pert = ls + rng_gumbel(seed, unsigned(t), unsigned(id));
+        if (pert > best || (pert == best && id < bi)) { best = pert; bi = id; }
+    }
+    float gbest = best;
+    int gid = (bi < 0) ? 0x7fffffff : bi;
+    warp_argmax(gbest, gid);
+    if (lane == 0) out_idx[t] = (gbest == LMH_NEG_INF) ? -1 : gid;
+}
 
 }  // namespace tmq

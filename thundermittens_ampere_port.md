@@ -58,6 +58,114 @@ equivalent like TM did, adjusted for 3090's compute/bandwidth ratio).
 
 ## Status
 
+- 2026-07-04 STEP 4 COMPLETE + BINDINGS GREEN: full pytest 75/75 stable
+  (3 consecutive runs; test_step4.py 8 + elementwise 22 + w6 7 + serving 10
+  + quant 26 + parametrized). New python API: lm_head_sample_topk/topp,
+  qgemm_actorder/blockscale, mla_kv_insert, mla_decode_partition,
+  mla_decode_fp8_partition, mla_decode_fp8_sparse(partition_size=),
+  paged_attention_gqa_staged, attn_window. Test gotcha: qgemm_blockscale
+  reference must replay the kernel's HALF code*scale multiply (random e4m3
+  codes reach +-448 — fp32-ref rounding gap exceeds tolerance).
+
+- 2026-07-04 STEP 5 PERF (part 1, correctness-gated): dequant8 SPAN
+  SPECIALIZATIONS landed for 15 formats (q8_0 q4_0 mxfp8 mxfp4 nvfp4
+  fp4_e2m1 mxfp6 both + q2_K q3_K q4_K q5_K q6_K + iq4_nl iq4_xs iq2_xxs
+  iq2_xs iq3_xxs iq1_s): block scale / packed sub-scale / grid entry decoded
+  ONCE per 8-span (i-quants: one 8-byte grid lookup serves the whole span —
+  the divergent __constant__ traffic drops 8x). ALL 29 formats still
+  dequant-EXACT + gemv PASS; qgemm/qflux/lm_head suites re-verified.
+  Directional numbers UNDER CONTENTION (external job on all 8 GPUs):
+  mxfp8 85 GB/s, mxfp4 154, nvfp4 160, mxfp6 228 (were 30-80);
+  q2_K 103, q4_K 157, q6_K 168 (were 28-165); iq2_xxs 22, iq3_xxs 17,
+  iq1_s/iq2_xs ~9 (were 1.2-7). CANONICAL numbers pending idle GPUs.
+  REMAINING Step-5 (needs idle GPUs to measure): qgemm cp.async ring /
+  44-TFLOP-GEMM dequant route, decode occupancy batching, i-quant smem
+  tables (if constant-cache still binds after the 8x lookup cut),
+  vs-torch table + final 8-GPU sweep + README perf refresh.
+
+- 2026-07-04 STEP 4 (deferred items) KERNELS COMPLETE, all harnesses green:
+  * mla bf16 kv_insert<128/256/512> (norm modes 0/2, neg-slot skip) +
+    mla_decode_partition<512,64> + mla_decode_fp8_v<SPARSE,PART> (fp8 sparse
+    gather-by-index, dense partition, sparse partition — all combine via the
+    existing paged_attention_reduce<bf16,512>): mla.out now 14/14.
+  * lm_head top-k (Family-B per-tile partials + Family-A global merge +
+    Gumbel-max) and top-p (per-tile tempered lse -> TRUE full-vocab
+    normalizer, 32-step bisection): fp16 + all quant formats;
+    lm_head_topkp.out 3/3 exact vs fp64 oracle + bit-parity RNG replay.
+  * qgemm_actorder (GPTQ act-order, in-kernel X gather by perm — fused into
+    the fragment fill) + qgemm_blockscale (fp8_raw codes x (N/128,K/128)
+    fp16 tile scales): qgemm_variants.out 2/2 vs fp64 over exactly-
+    dequantized weights.
+  * paged_attention_gqa_staged (flashinfer-style smem KV staging shared by
+    the kv-head's query-head warps): BIT-FOR-BIT equal to v1 (same op
+    order). attn_window (Mistral/Gemma sliding-window causal, warp/query
+    row): both vs fp64. kv_cache.out now 28/28.
+  Step-4 bindings added to tm_cuda_ext.cu (lm_head_sample_topk/topp,
+  qgemm_actorder/blockscale) + tm_cuda_serving.cu (mla_kv_insert,
+  mla_decode_partition, mla_decode_fp8_partition/sparse, gqa_staged,
+  attn_window) + test_step4.py; rebuild in flight.
+
+- 2026-07-04 W6 COMPLETE (coverage): kernels/moe/ (route_topk via
+  masked_topk, histogram/scan/scatter permute, 32-pad schedule w/ -1
+  sentinels, gather, grouped GEMMs square/rect/fused-swiglu [scalar-FMA
+  correctness form; mma route = perf pass], finalize) — moe_test.out 8/8,
+  END-TO-END MoE MLP 5.9e-7 vs dense fp64. kernels/lin_attn_tm/ (non-causal
+  linear_attn, serial causal scan, 3-kernel chunk-PARALLEL lin_chunk_kv/
+  scan/out [column-owner smem state, no barriers], cmplx_matmul) —
+  linattn_test.out 4/4. Bindings tm_cuda_w6.cu (moe_route_topk, moe_align,
+  moe_gather, moe_gemm(+swiglu), moe_finalize, linear_attn(causal,chunked),
+  cmplx_matmul) + test_w6.py.
+
+- 2026-07-04 W3 + W6 BINDINGS GREEN: full pytest 67/67 (elementwise 22 +
+  w6 7 + serving 10 + quant 26 + adamw-tolerance fix: torch computes
+  sqrt(v)/sqrt(bc2)+eps vs TM sqrt(v/bc2)+eps — fp32 op-order only).
+  4-TU extension: tm_cuda_ext + serving + elementwise + w6.
+  BUILD GOTCHA: nvcc needs -I../serving; #define inside a macro argument
+  (DISPATCH_T(x, {#define HAD...})) does NOT expand — use templated
+  launcher fns.
+
+- 2026-07-04 W3 KERNELS LANDED (kernels/elementwise/): tm_elementwise_kernels.cuh
+  + elementwise_test.cu — ALL 56 fp64-oracle checks PASS on first full run
+  (2 harness bugs only: wrong rstd buffer fed to layernorm_bwd_dx, fp64-vs-fp32
+  add tolerance). Coverage: rms_norm/layernorm fwd + BOTH backwards each
+  (dx-only Liger factorization w/ host rstd|mean, fully-fused in-kernel stats +
+  atomic fp32 dW/dB), add_norm rms+ln with fp8 e4m3 epilogues (static + dynamic
+  absmax/448 per-row scale; codes BIT-EXACT vs host RNE encoder replay),
+  softmax, gelu fwd/bwd, glu all 6 modes fwd/bwd (reglu/geglu/swiglu/
+  swiglu_oai(alpha,limit)/geglu_erf A&S-approx-consistent/geglu_quick; bwds
+  verified against fp64 central finite differences of independently transcribed
+  forwards), dropout (mask-free counter-RNG, exact replay), cross_entropy
+  online-LSE fwd/bwd + _mw 4-warp variants (ignore_index/label_smoothing/
+  z_loss/softcap all exact vs fp64 analytic, every config x both schedules),
+  embedding lookup + atomic AND sorted-segment backwards + multimodal
+  build_src/merge, hadamard FWHT D64/128/256/512 (register+shfl_xor
+  butterflies), adamw, add. Bindings TU tm_cuda_elementwise.cu (~30 fns,
+  fp32/fp16/bf16 dispatch) + test_elementwise.py (torch autograd oracles)
+  written; extension rebuild in flight.
+
+- 2026-07-04 STEP 1 COMPLETE: serving/decode bindings live in tk_cuda.
+  tm_cuda_serving.cu (~23 wrappers: kv scatter/gather/copy_blocks, paged v1
+  w/ alibi/mask/window + v2 partition/reduce fused host-side, rope_kv/rope_q,
+  attn_q (q8_0/q4_0/fp8), mla decode bf16+fp8 / insert / q_norm_rope, sample
+  (all modes), penalties/bitmask/bad_words, beam_advance, spec verify
+  linear+tree, build_dynamic_tree, spec_compact, kv_meta) + split
+  serving/*_kernels.cuh headers (harnesses re-verified). Combined pytest
+  36/36 GREEN (test_serving.py 10 + test_tk_cuda.py 26).
+
+- 2026-07-04 W5 COMPLETE (kernels/serving/): sampling.cu 8/8 — argmax/
+  categorical/top_k EXACT vs host (bit-identical RNG), top_p/min_p/
+  typical_p bisection samplers agree with double oracles, penalties (vLLM
+  order + min-length EOS mask) + grammar bitmask + bad-words elementwise-
+  exact. spec_beam.cu 3/3 with ZERO mismatches: beam advance (single-pass
+  LSE + per-lane top-2BM + Family-B merge; TRT-LLM 2-pass select), spec
+  linear rejection sampling + spec_compact (chunked block scan) +
+  kv_meta, dynamic-tree build + target-only tree rejection verify
+  (lane-0 walk + cooperative terminal Gumbel). The FULL quantized
+  inference pipeline is now live on Ampere end-to-end: 30-format weights
+  -> qgemm/qgemv/lm_head -> paged + quantized-KV + MLA attention ->
+  samplers/beam/spec decode. Remaining waves: W3 elementwise/training,
+  W6 misc.
+
 - 2026-07-03 W4 STARTED, kv_cache core LANDED: kernels/serving/kv_cache.cu —
   paged layout (vLLM-compatible: (blocks, bs, HKV, D); block_table i32 with
   <0 unmapped; slot_mapping i64), kv_cache_zero/scatter/gather/clone/
@@ -81,9 +189,18 @@ equivalent like TM did, adjusted for 3090's compute/bandwidth ratio).
   mla_kv_insert_fp8 + mla_decode_fp8 (V4: 448 NoPE e4m3 w/ per-64 UE8M0
   scales + 64 bf16 GPT-J rope, packed 576B+8B rows) - full insert->decode
   round trip vs fp64 oracle over the real cache bytes.
-  W4 REMAINING: attn_varlen (worklist builder + head-major pad/gather),
-  beam copy-pair/remap kernels, xcache reader, mla sparse + partitioned
-  variants, mla bf16 insert.
+  beam_xcache.cu LANDED 3/3 (beam_build_copy_pairs + beam_remap_block_table
+  vs CPU ref; kv_cache_scales absmax/240 exact; paged_attention_xcache
+  reading vLLM's x-packed layout, exact vs fp64).
+  attn_varlen.cu LANDED 3/3: block_exclusive_scan_i32 primitive (reused by
+  W5 spec_compact + MoE), varlen_build_worklist (device cu_seqlens -> tile
+  worklist + pad offsets, sentinel-filled), pad_gather/regather round trip
+  bit-exact, attn_varlen_prefill (ragged + prefix context>=qlen + GQA over
+  paged KV, worklist-driven 8-warps-per-tile) exact vs fp64.
+  W4 COMPLETE (2026-07-04). Serving total: 66/66 tests. Small follow-ups
+  deferred: mla sparse + partitioned variants, mla bf16 insert, the
+  gqa_staged shared-memory decode variant (perf), tile/mma prefill shapes
+  (perf pass).
 
 - 2026-07-03 W2 STARTED, qgemm core LANDED: kernels/quant/qgemm.cu —
   torch-linear semantics Y(M,N)=X(M,K)@dequant(Wq)^T, raw m16n8k16 fp16 mma.

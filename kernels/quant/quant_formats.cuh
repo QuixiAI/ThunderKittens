@@ -285,4 +285,81 @@ __device__ __forceinline__ void dequant8(const uint8_t* base, int col0, float w[
     for (int i = 0; i < 8; i++) w[i] = FMT::dequant(base, col0 + i);
 }
 
+// ---- span specializations (TM tk_dequant8): hoist the block scale to ONE
+// decode per 8-span instead of one per element, and batch the nibble/code
+// extraction. col0 is always a multiple of 8 and the span never straddles a
+// block, so a 4-bit span is uniformly low or high nibbles. Bit-identical
+// results (same decode, same fp32 multiply). ----
+template<>
+__device__ __forceinline__ void dequant8<q8_0>(const uint8_t* base, int col0, float w[8]) {
+    const float s = half_at(base);
+    const int8_t* qs = reinterpret_cast<const int8_t*>(base + 2);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = s * float(qs[col0 + i]);
+}
+template<>
+__device__ __forceinline__ void dequant8<q4_0>(const uint8_t* base, int col0, float w[8]) {
+    const float s = half_at(base);
+    const uint8_t* qs = base + 2;
+    const int sh = (col0 < 16) ? 0 : 4;
+    const int qo = (col0 < 16) ? col0 : col0 - 16;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = s * (int((qs[qo + i] >> sh) & 0x0F) - 8);
+}
+template<>
+__device__ __forceinline__ void dequant8<mxfp8>(const uint8_t* base, int col0, float w[8]) {
+    const float s = e8m0_decode(base[0]);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = s * e4m3_decode(base[1 + col0 + i]);
+}
+template<>
+__device__ __forceinline__ void dequant8<mxfp4>(const uint8_t* base, int col0, float w[8]) {
+    const float s = e8m0_decode(base[0]);
+    const uint8_t* qs = base + 1;
+    const int sh = (col0 < 16) ? 0 : 4;
+    const int qo = (col0 < 16) ? col0 : col0 - 16;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = s * e2m1_decode((qs[qo + i] >> sh) & 0x0F);
+}
+template<>
+__device__ __forceinline__ void dequant8<nvfp4>(const uint8_t* base, int col0, float w[8]) {
+    const float s = e4m3_decode(base[0]);
+    const uint8_t* qs = base + 1;
+    const int sh = (col0 < 8) ? 0 : 4;
+    const int qo = (col0 < 8) ? col0 : col0 - 8;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = s * e2m1_decode((qs[qo + i] >> sh) & 0x0F);
+}
+template<>
+__device__ __forceinline__ void dequant8<fp4_e2m1>(const uint8_t* base, int col0, float w[8]) {
+    const float s = half_at(base);
+    const uint8_t* qs = base + 2;
+    const int sh = (col0 < 16) ? 0 : 4;
+    const int qo = (col0 < 16) ? col0 : col0 - 16;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = s * e2m1_decode((qs[qo + i] >> sh) & 0x0F);
+}
+template<>
+__device__ __forceinline__ void dequant8<mxfp6<true>>(const uint8_t* base, int col0, float w[8]) {
+    const float s = e8m0_decode(base[0]);
+    #pragma unroll
+    for (int g = 0; g < 2; g++) {                        // 8 cols = two 24-bit groups
+        const uint8_t* p = base + 1 + 3 * ((col0 >> 2) + g);
+        const unsigned val = unsigned(p[0]) | (unsigned(p[1]) << 8) | (unsigned(p[2]) << 16);
+        #pragma unroll
+        for (int i = 0; i < 4; i++) w[4 * g + i] = s * e3m2_decode((val >> (6 * i)) & 0x3F);
+    }
+}
+template<>
+__device__ __forceinline__ void dequant8<mxfp6<false>>(const uint8_t* base, int col0, float w[8]) {
+    const float s = e8m0_decode(base[0]);
+    #pragma unroll
+    for (int g = 0; g < 2; g++) {
+        const uint8_t* p = base + 1 + 3 * ((col0 >> 2) + g);
+        const unsigned val = unsigned(p[0]) | (unsigned(p[1]) << 8) | (unsigned(p[2]) << 16);
+        #pragma unroll
+        for (int i = 0; i < 4; i++) w[4 * g + i] = s * e2m3_decode((val >> (6 * i)) & 0x3F);
+    }
+}
+
 }  // namespace tmq
