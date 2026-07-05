@@ -196,6 +196,9 @@ rg -n "moe_wna16|marlin|dequant|per_token_group|nvfp4" .reference
   table on one idle GPU (the source of the numbers above).
 - **`perf/bench_vs_torch.py`** — quant GEMV/GEMM vs `torch.matmul` fp16 at matched
   shapes (relative speedup is contention-robust; absolutes need an idle GPU).
+- **`perf/bench_metalforge.py`** — throughput of the MetalForge serving-layer
+  kernels (quant MoE GEMMs, GDN decode, selective scan, quant epilogues, LSE merge,
+  FWHT). One dedicated idle GPU; baselines recorded below.
 - **`perf/bench_reference.py`** — cuBLAS/SDPA/LayerNorm framework roofline sweep.
 - Per-kernel standalone `.out` harnesses print their own timing + correctness;
   record through the harness so metadata lands in `results.jsonl`.
@@ -226,6 +229,31 @@ sections) and `make nsys` per kernel. Use them when a timing A/B can't explain a
 result — check achieved occupancy, memory throughput %, warp-stall reasons,
 `smsp__inst_executed` for dp4a/mma issue, and bank conflicts. Don't commit
 profiler artifacts; record their path + a summary.
+
+## MetalForge Serving-Kernel Baselines (idle RTX 3090, 2026-07-05)
+
+Measured by `perf/bench_metalforge.py` on a dedicated idle 3090 (stable to ~5%
+across two GPUs). These are the **correctness-first** ports — the bandwidth-bound
+primitives already sit near the roofline; the compute-bound MoE GEMMs and the
+serial scan have the headroom.
+
+| kernel | shape | measured | note |
+|---|---|--:|---|
+| `moe_gemm_fp8` | E=8, N=K=4096, 2048 rows | **6.5 TFLOP/s** | per-tile e4m3 dequant in the mma path (no cuBLAS handoff) |
+| `moe_gemm_wna16` int4 | same | **4.9 TFLOP/s** | uint32 de-interleave + per-group scale/zp |
+| `moe_gemm_wna16` int8 | same | **3.7 TFLOP/s** | |
+| `gdn_linear_attention` | 128 seqs, GQA 2/8, D=128, decode | **345k tok/s** · 360 GB/s state | one warp per (req,hv,dv); state-bandwidth-bound |
+| `selective_scan_varlen` | dim=2048, dstate=16, one 2048-tok seq | **21 GB/s** | serial recurrence, latency-bound — scales with concurrent seqs |
+| `rms_norm_quant` (fp8 dyn) | 8192×4096 | **181 GB/s** in | multi-pass (amax → normalize → e4m3) |
+| `silu_and_mul_quant` (fp8) | 8192×4096 | **374 GB/s** in | |
+| `merge_attn_states` | 8192 tok × 8 heads × 128 | **415 GB/s** | 2-way LSE combine |
+| `indexer_k_quant_and_cache` | 8192 tok × 128 | 92 GB/s in | tiny kernel, launch-bound at this size |
+| `fwht_rotate` (fwd) | 65536 rows × 128 | **815 GB/s** | ~87% of peak — warp-shuffle butterflies |
+
+Optimization headroom worth a pass: the MoE mma GEMMs (cp.async double-buffer the
+B-tile dequant; the weight-only qgemm ring is the template), and `rms_norm_quant`
+(fuse the amax pass / vectorize the fp8 store). The FWHT, merge, and SwiGLU-quant
+kernels are effectively done.
 
 ## Shape Strategy
 

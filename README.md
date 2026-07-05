@@ -134,6 +134,14 @@ correctness pass) — the same Marlin dequant discipline the weight-only GEMMs u
 per-expert padded schedule. `dp4a`/IMMA-backed int paths again *exceed* the Metal original on
 hardware Apple never had.
 
+Throughput on an **idle 3090** (`perf/bench_metalforge.py`, full table in
+[`perf/perf.md`](perf/perf.md)): quantized MoE grouped GEMM (E=8, N=K=4096, 2048 rows) **6.5
+TFLOP/s** fp8 / 4.9 int4 / 3.7 int8; **GDN decode 345k tok/s** (128 seqs, GQA, D=128, ~360 GB/s
+over recurrent state); `merge_attn_states` **415 GB/s**; SwiGLU→fp8 **374 GB/s**; the TurboQuant
+FWHT rotation **815 GB/s** (~87% of peak). These are the correctness-first ports — the
+bandwidth-bound primitives already run near the roofline; the mma-path MoE GEMMs and the serial
+selective-scan (21 GB/s on a single long sequence, occupancy-bound) are the tuning headroom.
+
 ## Quick start
 
 ```bash
