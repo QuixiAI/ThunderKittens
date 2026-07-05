@@ -1,18 +1,28 @@
-# ThunderKittens — Ampere Edition
+# QuixiCore CUDA
+
+QuixiCore CUDA is the NVIDIA CUDA implementation of the QuixiCore kernel library.
+
+It is a standalone native implementation for NVIDIA GPUs starting from Ampere, covering both consumer and datacenter hardware. It shares no implementation code with the other QuixiCore backends.
+
+It implements the contract defined by [QuixiAI/QuixiCore](https://github.com/QuixiAI/QuixiCore): the same operation names, quant formats, correctness expectations, benchmark methodology, and public library identity as the other QuixiCore backends.
+
+**Native implementations. Shared contract. No shared code.**
 
 <div align="center" >
-    <img src="assets/thunderkittens.png" height=350 alt="ThunderKittens logo" style="margin-bottom:px"/><br/>
-    <em>Tile primitives for speedy kernels — now running where they were never supposed to.</em><br/><br/>
+    <img src="assets/thunderkittens.png" height=350 alt="QuixiCore CUDA logo" style="margin-bottom:px"/><br/>
+    <em>Native NVIDIA CUDA kernels for Ampere and newer GPUs.</em><br/><br/>
 </div>
 
-This is the [QuixiAI](https://github.com/QuixiAI) fork of
+## Origin And Focus
+
+This repository is the [QuixiAI](https://github.com/QuixiAI) CUDA backend for QuixiCore. It was renamed from QuixiAI's ThunderKittens Ampere fork and remains based on
 [ThunderKittens](https://github.com/HazyResearch/ThunderKittens). Upstream's README says:
 
 > *"We no longer actively support Ampere GPUs."*
 
-This fork is the counterexample. **Every SM90+ kernel in this repository runs on an RTX 3090** —
+This backend is the counterexample. **Every SM90+ kernel in this repository runs on an RTX 3090** —
 attention forward *and backward*, GEMMs, the linear-attention family, Mamba-2, FFT convolutions —
-plus a quantization stack ported from [ThunderMittens](https://github.com/QuixiAI/ThunderMittens)
+plus a quantization stack ported from [QuixiCore Metal](https://github.com/QuixiAI/QuixiCore-Metal)
 (the Apple Metal port of TK) covering **30 weight formats, every one bit-exact**, on silicon that
 has hardware support for almost none of them.
 
@@ -53,7 +63,7 @@ the fp8 SM90 guard, and a 32-bit register↔shared fast path inconsistent with `
 
 ## The quant stack: 30 formats, zero excuses
 
-Ported from ThunderMittens' format layer (`kernels/quant/`), packed **byte-identically** — one
+Ported from QuixiCore Metal's format layer (`kernels/quant/`), packed **byte-identically** — one
 quantized checkpoint serves Metal and CUDA. Every format's GPU dequant is **bit-exact (max diff
 0)** against the reference quantizer, from 1.56 to 8.5 bits per weight:
 
@@ -98,7 +108,7 @@ Sampling is driven by a counter-based RNG with **proven bit-parity** to its nump
 the fused GPU draw equals the reference draw exactly, so stochastic kernels have deterministic
 oracles.
 
-The rest of the ThunderMittens stack is **ported and live** — the serving path (paged attention
+The rest of the QuixiCore Metal serving stack is **ported and live** — the serving path (paged attention
 v1/v2, quantized + fp8 KV cache, MLA decode incl. bf16/fp8/sparse/partitioned, RoPE insert,
 sliding-window and GQA-staged attention, varlen prefill), the decode stack (full sampler family,
 beam search, speculative + tree verification), the elementwise/norm/training family (RMSNorm,
@@ -150,7 +160,7 @@ the headroom.
 # any per-kernel build (Makefiles sit next to sources):
 cd kernels/gemm/bf16_h100 && make ARCH=SM86     # SM90 and SM100 still work, unchanged
 
-# quant stack, standalone golden tests (needs a ~/ThunderMittens checkout for the reference):
+# quant stack, standalone golden tests (needs the Metal format reference checkout):
 cd kernels/quant
 python gen_golden.py golden                      # quantize with TM's quant.py (numpy)
 nvcc qgemv.cu -std=c++20 -O2 -DKITTENS_SM86 -gencode arch=compute_86,code=sm_86 -o qgemv.out
@@ -182,22 +192,22 @@ Learn more from the Hazy Research blog posts:
 * [ThunderKittens Now on Blackwells! Mar 2025](https://hazyresearch.stanford.edu/blog/2025-03-15-tk-blackwell)
 * [ThunderKittens 2.0: Even Faster Kernels for Your GPUs, Feb 2026](https://hazyresearch.stanford.edu/blog/2026-02-19-tk-2)
 
-The Kittens Cinematic Universe:
+Backend lineage:
 
 * [ThunderKittens](https://github.com/HazyResearch/ThunderKittens) for NVIDIA (upstream)
 * [HipKittens](https://github.com/HazyResearch/HipKittens) for AMD
-* [ThunderMittens](https://github.com/QuixiAI/ThunderMittens) for Apple Silicon
-* **This fork** for the NVIDIA hardware people actually own
+* [QuixiCore Metal](https://github.com/QuixiAI/QuixiCore-Metal) for Apple Silicon
+* **QuixiCore CUDA** for NVIDIA Ampere+ hardware
 
 Papers: [Single GPU](https://arxiv.org/abs/2410.20399) ·
 [Multiple GPUs](https://arxiv.org/abs/2511.13940)
 
 ## Credits
 
-- [HazyResearch](https://hazyresearch.stanford.edu/) — ThunderKittens itself. This fork tracks
+- [HazyResearch](https://hazyresearch.stanford.edu/) — ThunderKittens itself. This backend tracks
   upstream and adds Ampere; it takes nothing away.
-- [ThunderMittens](https://github.com/QuixiAI/ThunderMittens) — the Apple Metal port whose
-  kernels and format layer this fork brings to CUDA, and the proof that "none of this was
+- [QuixiCore Metal](https://github.com/QuixiAI/QuixiCore-Metal) — the Apple Metal backend whose
+  kernels and format layer this backend brings to CUDA, and the proof that "none of this was
   supposed to work" is a solvable condition.
 - **[AlpinDale](https://github.com/AlpinDale)** ([@AlpinDale](https://x.com/AlpinDale)) — author of
   **MetalForge**, the Apple-Silicon LLM-serving kernel layer that inspired the entire serving-layer
