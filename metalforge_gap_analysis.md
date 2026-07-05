@@ -24,8 +24,8 @@ Status legend: ❌ missing (real port) · ⚠️ family present, mode missing ·
 | 3 | **✅ CORE LANDED (Wave M4)** — `rejection_greedy_sample`, `rejection_random_sample`, `sample_recovered_tokens`, `eagle_prepare_inputs_padded` | **EAGLE speculative decoding** | `kernels/serving/eagle_kernels.cuh`: rejection verify (greedy + externalized-uniform random), residual recovered-token argmax, prepare-inputs index math. Exact host replay. (`eagle_expand`/`copy_and_expand`/`step_slot_mapping` bookkeeping = follow-up.) |
 | 4 | **✅ LANDED (Wave M5)** — `convert_vertical_slash_indexes`, `tau_tail` | **MInference sparse attention** | `kernels/serving/sparse_serving_kernels.cuh`: the two-pointer vertical/slash index builder (exact host-replay parity) + the tau/temperature Q/V gate. The consumer (`mla_decode_fp8_v` sparse walk) already exists. |
 | 5 | **✅ LANDED (Wave M5)** — `indexer_k_quant_and_cache` | **DeepSeek-V3.2 lightning-indexer** | `sparse_serving_kernels.cuh`: fp8 K-quant into the paged cache with per-block scale (optional UE8M0), reusing the `mla_kv_insert_fp8` idiom. fp8 round-trip validated. (`cp_gather` inverse = follow-up.) |
-| 6 | `turboquant.metal` (`tq_encode`, `inverse_fwht_in_place`) | **TurboQuant** rotation-based cache-compression codec | Not ported (we have plain hadamard, not the TQ encode/decode codec) |
-| 7 | `moe_lora_align`, `layout_lora` | **LoRA** apply + MoE-LoRA alignment | No LoRA kernels at all |
+| 6 | **✅ CORE LANDED (Wave M6)** — random-sign FWHT (`inverse_fwht_in_place` core) | **TurboQuant** rotation codec | `kernels/quant/turboquant.cuh`: the parameterized random-sign FWHT rotation (self-inverse, QuaRot/SpinQuant-style), D 64/128/256/512, sign as a runtime buffer. self-inverse + host-parity exact. (The DeepSeek sub-8-bit K-uniform / V-centroid cache codec `tq_encode` that wraps it = follow-up.) |
+| 7 | **✅ LANDED (Wave M6)** — `moe_lora_align`, `permute_cols` | **LoRA / act-order** | `turboquant.cuh`: per-LoRA-sharded MoE align (histogram → block-pad → scatter → expert_ids) + GPTQ/act-order 16-bit column permute. Exact host-replay. |
 | 8 | **✅ LANDED (Wave M4)** — DRY, no-repeat-ngram, top-a, top-nσ, η/ε-cutoff, XTC, quadratic, skew | **Sampler tail-cutoff zoo** | `kernels/serving/logits_proc_kernels.cuh`: all 9 processors (warp-per-row masks + skew CDF block-scan + serial ngram/DRY). 9/9 exact / fp64. Deterministic — the draw stays on `rng_gumbel`. |
 | 9 | `silu_and_mul_fp8_quant`, `silu_and_mul_per_block_{fp8,int8}_quant` | **Fused activation → quantized output** (SwiGLU that emits fp8/int8 in one pass) | Our GLU emits bf16/fp16/fp32; fp8 quant is only fused into the *norm* (add_norm), not the activation |
 
@@ -44,7 +44,7 @@ Status legend: ❌ missing (real port) · ⚠️ family present, mode missing ·
 | **Mamba selective scan** | `mamba2` SSD + ✅ **M3** `selective_scan_fwd_varlen` (ragged Mamba-1 scan, paged state, softplus/D/z/n_groups) | **APC** (mid-sequence chunk checkpointing) remains |
 | **QK-norm+RoPE** | `mla_q_norm_rope`, `rope_kv` w/ norm | **MiniMax** `minimax_qk_rms_norm` specific variant |
 | **bitmask** | `apply_token_bitmask` (consume) | `packbits` (produce the bitmask) |
-| **column permute** | folded into `qgemm_actorder` (in-kernel gather) | standalone `permute_cols_16bit` (materialized) |
+| **column permute** | ✅ **M6** standalone `tm6::permute_cols` + folded into `qgemm_actorder` | (done) |
 
 ---
 
