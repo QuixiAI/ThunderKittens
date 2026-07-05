@@ -19,7 +19,7 @@ static torch::Tensor py_moe_gemm_fp8(torch::Tensor A, torch::Tensor B, torch::Te
     QK(A); QK(B); QK(Bscale); QK(eot);
     const int rows = A.size(0);
     auto Y = torch::zeros({rows, N}, A.options().dtype(torch::kFloat));
-    dim3 grid(N / 16, rows / 16);
+    dim3 grid(N / 16, rows / 32);      // 32-row M-blocked tiles (one block per expert tile)
     moe_gemm_fp8<<<grid, 32, 0, qstream()>>>(Y.data_ptr<float>(), hp(A),
         B.data_ptr<uint8_t>(), Bscale.data_ptr<float>(), eot.data_ptr<int>(), rows, int(N), int(K));
     return Y;
@@ -32,7 +32,7 @@ static torch::Tensor py_moe_gemm_wna16(torch::Tensor A, torch::Tensor qweight, t
     auto Y = torch::zeros({rows, N}, A.options().dtype(torch::kFloat));
     const uint8_t* qz = qzeros ? qzeros->data_ptr<uint8_t>() : nullptr;
     const int has_zp = qzeros ? 1 : 0;
-    dim3 grid(N / 16, rows / 16);
+    dim3 grid(N / 16, rows / 32);      // 32-row M-blocked tiles (one block per expert tile)
     if (bit == 4)
         moe_gemm_wna16<4><<<grid, 32, 0, qstream()>>>(Y.data_ptr<float>(), hp(A),
             reinterpret_cast<const uint32_t*>(qweight.data_ptr()), hp(scales), qz,
@@ -49,7 +49,7 @@ static torch::Tensor py_moe_gemm_nvfp4(torch::Tensor A, torch::Tensor B, torch::
     QK(A); QK(B); QK(Asc); QK(Bsc); QK(alphas); QK(eot); QK(erow0); QK(sfo);
     const int rows = eot.size(0) * 32;
     auto Y = torch::zeros({rows, N}, alphas.options().dtype(torch::kFloat));
-    dim3 grid(N / 16, rows / 16);
+    dim3 grid(N / 16, rows / 32);      // 32-row M-blocked tiles (one block per expert tile)
     moe_gemm_nvfp4<<<grid, 32, 0, qstream()>>>(Y.data_ptr<float>(), A.data_ptr<uint8_t>(),
         B.data_ptr<uint8_t>(), Asc.data_ptr<uint8_t>(), Bsc.data_ptr<uint8_t>(),
         alphas.data_ptr<float>(), eot.data_ptr<int>(), erow0.data_ptr<int>(),

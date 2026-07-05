@@ -239,21 +239,36 @@ serial scan have the headroom.
 
 | kernel | shape | measured | note |
 |---|---|--:|---|
-| `moe_gemm_fp8` | E=8, N=K=4096, 2048 rows | **6.5 TFLOP/s** | per-tile e4m3 dequant in the mma path (no cuBLAS handoff) |
-| `moe_gemm_wna16` int4 | same | **4.9 TFLOP/s** | uint32 de-interleave + per-group scale/zp |
-| `moe_gemm_wna16` int8 | same | **3.7 TFLOP/s** | |
+| `moe_gemm_fp8` | E=8, N=K=4096, 2048 rows | **10.5 TFLOP/s** | per-tile e4m3 dequant in the mma path (no cuBLAS handoff) |
+| `moe_gemm_wna16` int4 | same | **7.0 TFLOP/s** | uint32 de-interleave + per-group scale/zp |
+| `moe_gemm_wna16` int8 | same | **5.7 TFLOP/s** | |
 | `gdn_linear_attention` | 128 seqs, GQA 2/8, D=128, decode | **345k tok/s** · 360 GB/s state | one warp per (req,hv,dv); state-bandwidth-bound |
 | `selective_scan_varlen` | dim=2048, dstate=16, one 2048-tok seq | **21 GB/s** | serial recurrence, latency-bound — scales with concurrent seqs |
-| `rms_norm_quant` (fp8 dyn) | 8192×4096 | **181 GB/s** in | multi-pass (amax → normalize → e4m3) |
+| `rms_norm_quant` (fp8 dyn) | 8192×4096 | **304 GB/s** in | multi-warp block/row + folded amax |
 | `silu_and_mul_quant` (fp8) | 8192×4096 | **374 GB/s** in | |
 | `merge_attn_states` | 8192 tok × 8 heads × 128 | **415 GB/s** | 2-way LSE combine |
 | `indexer_k_quant_and_cache` | 8192 tok × 128 | 92 GB/s in | tiny kernel, launch-bound at this size |
 | `fwht_rotate` (fwd) | 65536 rows × 128 | **815 GB/s** | ~87% of peak — warp-shuffle butterflies |
 
-Optimization headroom worth a pass: the MoE mma GEMMs (cp.async double-buffer the
-B-tile dequant; the weight-only qgemm ring is the template), and `rms_norm_quant`
-(fuse the amax pass / vectorize the fp8 store). The FWHT, merge, and SwiGLU-quant
-kernels are effectively done.
+### Optimization pass (2026-07-05)
+
+Two wins landed after the first baseline:
+
+- **Quant MoE GEMMs — 32-row M-blocking (1.4–1.6×).** The mma path re-loaded and
+  re-dequantized the weight `B` fragment once per 16-row tile. The expert schedule
+  is already per-32-row (`expert_of_tile`), so each block now owns the full 32-row
+  tile and reuses every dequantized `B` fragment across both 16-row M-subtiles —
+  halving the dominant dequant traffic. fp8 **6.5→10.5**, int4 **4.9→7.0**, int8
+  **3.7→5.7 TFLOP/s**. (`grid.y` = `rows/32`; 4 accumulator sets, 8 mma/k-step.)
+- **`rms_norm_quant` — multi-warp block per row + folded amax (1.7×).** At 181 GB/s
+  it was nowhere near the roofline: one warp per row capped occupancy at ~33% and
+  serialized 128 elems/lane. Rewrote to one 256-thread block per row (block-wide
+  sum/max reduction), and folded the dynamic-scale `max|v·w|` into the
+  sum-of-squares sweep (`amax = inv_rms·max|v·w|`, 3 passes → 2). **181→304 GB/s.**
+
+Remaining headroom: the MoE GEMMs can still cp.async double-buffer the B-tile and
+widen to 32×32 (N-blocking) for A-reuse; `selective_scan` needs chunk-parallelism
+to lift the single-sequence occupancy wall. FWHT, merge, and SwiGLU-quant are done.
 
 ## Shape Strategy
 

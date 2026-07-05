@@ -51,9 +51,9 @@ int main() {
     for (int fp8 = 1; fp8 >= 0; --fp8) {
         std::vector<double> ref; rmsref(false, ref);
         uint8_t* dc = dz<uint8_t>((size_t)M*D); float* dsc = dz<float>(M);
-        if (fp8) rms_norm_quant<half,true,true,false><<<M,32>>>(dc,dsc,nullptr,
+        if (fp8) rms_norm_quant<half,true,true,false><<<M,256>>>(dc,dsc,nullptr,
             reinterpret_cast<const half*>(dx),nullptr,reinterpret_cast<const half*>(dw),D,eps,0);
-        else rms_norm_quant<half,false,true,false><<<M,32>>>(dc,dsc,nullptr,
+        else rms_norm_quant<half,false,true,false><<<M,256>>>(dc,dsc,nullptr,
             reinterpret_cast<const half*>(dx),nullptr,reinterpret_cast<const half*>(dw),D,eps,0);
         CK(cudaDeviceSynchronize());
         auto cd=d2h(dc,(size_t)M*D); auto sc=d2h(dsc,M);
@@ -71,7 +71,7 @@ int main() {
         std::vector<double> ref; rmsref(true, ref);
         uint8_t* dc = dz<uint8_t>((size_t)M*D); float* dsc = dz<float>(M);
         __half* dro = dz<__half>((size_t)M*D);
-        rms_norm_quant<half,false,true,true><<<M,32>>>(dc,dsc,dro,
+        rms_norm_quant<half,false,true,true><<<M,256>>>(dc,dsc,dro,
             reinterpret_cast<const half*>(dx),reinterpret_cast<const half*>(dr),
             reinterpret_cast<const half*>(dw),D,eps,0);
         CK(cudaDeviceSynchronize());

@@ -135,12 +135,14 @@ per-expert padded schedule. `dp4a`/IMMA-backed int paths again *exceed* the Meta
 hardware Apple never had.
 
 Throughput on an **idle 3090** (`perf/bench_metalforge.py`, full table in
-[`perf/perf.md`](perf/perf.md)): quantized MoE grouped GEMM (E=8, N=K=4096, 2048 rows) **6.5
-TFLOP/s** fp8 / 4.9 int4 / 3.7 int8; **GDN decode 345k tok/s** (128 seqs, GQA, D=128, ~360 GB/s
-over recurrent state); `merge_attn_states` **415 GB/s**; SwiGLU→fp8 **374 GB/s**; the TurboQuant
-FWHT rotation **815 GB/s** (~87% of peak). These are the correctness-first ports — the
-bandwidth-bound primitives already run near the roofline; the mma-path MoE GEMMs and the serial
-selective-scan (21 GB/s on a single long sequence, occupancy-bound) are the tuning headroom.
+[`perf/perf.md`](perf/perf.md)): quantized MoE grouped GEMM (E=8, N=K=4096, 2048 rows) **10.5
+TFLOP/s** fp8 / 7.0 int4 / 5.7 int8; **GDN decode 345k tok/s** (128 seqs, GQA, D=128, ~360 GB/s
+over recurrent state); RMSNorm→fp8 **304 GB/s**; `merge_attn_states` **415 GB/s**; SwiGLU→fp8
+**374 GB/s**; the TurboQuant FWHT rotation **815 GB/s** (~87% of peak). An optimization pass took
+the MoE GEMMs **1.4–1.6×** (32-row M-blocking reuses each dequantized weight fragment across the
+tile) and `rms_norm_quant` **1.7×** (multi-warp block-per-row + folded amax); the serial
+selective-scan (21 GB/s on a single long sequence, occupancy-bound) and further MoE tiling remain
+the headroom.
 
 ## Quick start
 

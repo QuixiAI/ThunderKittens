@@ -39,39 +39,73 @@ __device__ __forceinline__ int8_t i8sat_i(int x) {
     return int8_t(max(-128, min(127, x)));
 }
 
-// RMSNorm (+optional residual) with quantized output. One warp per row.
-// FP8 -> e4m3 codes; else int8 codes. DYN -> per-row amax/QMAX scale in scale_out;
-// else static inv_scale (scale_out ignored). RESID -> v=x+residual, write res_out.
+// Block-wide reductions that broadcast the result to every thread (for the
+// multi-warp-per-row norm kernels). `partials` needs blockDim.x/32 floats;
+// `bcast` is one float. Both must be __syncthreads-safe across the two calls.
+__device__ __forceinline__ float block_sum_bcast(float v, float* partials, float* bcast) {
+    v = tms::warp_sum_f(v);
+    const int w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    if ((threadIdx.x & 31) == 0) partials[w] = v;
+    __syncthreads();
+    if (w == 0) {
+        float t = (threadIdx.x < nw) ? partials[threadIdx.x] : 0.0f;
+        t = tms::warp_sum_f(t);
+        if (threadIdx.x == 0) *bcast = t;
+    }
+    __syncthreads();
+    return *bcast;
+}
+__device__ __forceinline__ float block_max_bcast(float v, float* partials, float* bcast) {
+    v = tms::warp_max_f(v);
+    const int w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    if ((threadIdx.x & 31) == 0) partials[w] = v;
+    __syncthreads();
+    if (w == 0) {
+        float t = (threadIdx.x < nw) ? partials[threadIdx.x] : 0.0f;
+        t = tms::warp_max_f(t);
+        if (threadIdx.x == 0) *bcast = t;
+    }
+    __syncthreads();
+    return *bcast;
+}
+
+// RMSNorm (+optional residual) with quantized output. One *block* (multiple
+// warps) per row — D is split across all threads and reduced block-wide, which
+// lifts the one-warp-per-row occupancy/latency wall. FP8 -> e4m3 codes; else int8
+// codes. DYN -> per-row amax/QMAX scale in scale_out; else static inv_scale.
+// RESID -> v=x+residual, write res_out. Launch with blockDim a multiple of 32.
 template <typename T, bool FP8, bool DYN, bool RESID>
 __global__ void rms_norm_quant(uint8_t* __restrict__ codes, float* __restrict__ scale_out,
                                T* __restrict__ res_out, const T* __restrict__ x,
                                const T* __restrict__ residual, const T* __restrict__ weight,
                                int D, float eps, float inv_static) {
     const long base = (long)blockIdx.x * D;
-    const int lane = threadIdx.x;
-    float ss = 0.0f;
-    for (int j = lane; j < D; j += 32) {
+    const int tid = threadIdx.x, BLK = blockDim.x;
+    __shared__ float part[32];
+    __shared__ float bcast;
+    // Pass 1: sum-of-squares and (DYN) the un-normalized max|v*w| in one sweep.
+    // Since inv_rms is a positive per-row constant, amax = max|v*inv_rms*w| =
+    // inv_rms * max|v*w| — so the dynamic-scale max folds into this pass (2 sweeps
+    // total instead of 3).
+    float ss = 0.0f, maxvw = 0.0f;
+    for (int j = tid; j < D; j += BLK) {
         float v = nf(x[base + j]);
         if (RESID) { v += nf(residual[base + j]); res_out[base + j] = fn<T>(v); }
         ss += v * v;
+        if (DYN) maxvw = fmaxf(maxvw, fabsf(v * nf(weight[j])));
     }
-    ss = tms::warp_sum_f(ss);
+    ss = block_sum_bcast(ss, part, &bcast);
     const float inv_rms = rsqrtf(ss / float(D) + eps);
     const float qmax = FP8 ? 448.0f : 127.0f;
 
     float inv_scale = inv_static;
     if (DYN) {
-        float amax = 0.0f;
-        for (int j = lane; j < D; j += 32) {
-            const float v = RESID ? nf(res_out[base + j]) : nf(x[base + j]);
-            amax = fmaxf(amax, fabsf(v * inv_rms * nf(weight[j])));
-        }
-        amax = tms::warp_max_f(amax);
+        const float amax = block_max_bcast(maxvw, part, &bcast) * inv_rms;
         const float scale = amax / qmax;
         inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-        if (lane == 0) scale_out[blockIdx.x] = scale;
+        if (tid == 0) scale_out[blockIdx.x] = scale;
     }
-    for (int j = lane; j < D; j += 32) {
+    for (int j = tid; j < D; j += BLK) {
         const float v = RESID ? nf(res_out[base + j]) : nf(x[base + j]);
         const float y = v * inv_rms * nf(weight[j]) * inv_scale;
         codes[base + j] = FP8 ? tmq::e4m3_encode(y) : uint8_t(i8sat(y));

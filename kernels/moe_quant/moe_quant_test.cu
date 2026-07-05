@@ -54,7 +54,7 @@ int main() {
 
         auto dA = dnew(Ah); auto dB = dnew(B); auto dSc = dnew(Bsc); auto dEot = dnew(eot);
         float* dY = dzero<float>((size_t)total_rows * N);
-        dim3 grid(N / 16, total_rows / 16);
+        dim3 grid(N / 16, total_rows / 32);
         moe_gemm_fp8<<<grid, 32>>>(dY, reinterpret_cast<const half*>(dA), dB, dSc, dEot,
                                    total_rows, N, K);
         CK(cudaDeviceSynchronize());
@@ -111,7 +111,7 @@ int main() {
         auto dAb = dnew(Ab); auto dBb = dnew(Bb); auto dAsc = dnew(Asc); auto dBsc = dnew(Bsc);
         auto dal = dnew(alpha); auto deot = dnew(eot); auto der0 = dnew(erow0); auto dsfo = dnew(sfo);
         float* dY = dzero<float>((size_t)total_rows * N);
-        dim3 grid(N / 16, total_rows / 16);
+        dim3 grid(N / 16, total_rows / 32);
         moe_gemm_nvfp4<<<grid, 32>>>(dY, dAb, dBb, dAsc, dBsc, dal, deot, der0, dsfo,
                                      total_rows, N, K);
         CK(cudaDeviceSynchronize());
@@ -183,7 +183,7 @@ int main() {
         auto dA = dnew(Ah); auto dqw = dnew(qw); auto dsc = dnew(sc); auto dqz = dnew(qz);
         auto dEot = dnew(eot);
         float* dY = dzero<float>((size_t)total_rows * N);
-        dim3 grid(N / 16, total_rows / 16);
+        dim3 grid(N / 16, total_rows / 32);
         if (BIT == 4)
             moe_gemm_wna16<4><<<grid, 32>>>(dY, reinterpret_cast<const half*>(dA), dqw,
                 reinterpret_cast<const half*>(dsc), dqz, dEot, total_rows, N, K, GS, 1);

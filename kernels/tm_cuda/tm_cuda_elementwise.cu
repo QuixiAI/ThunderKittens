@@ -384,7 +384,7 @@ static std::vector<torch::Tensor> py_rms_norm_quant(torch::Tensor x, torch::Tens
     const half* rp = resid ? nqhp(*residual) : nullptr;
     half* rop = resid ? reinterpret_cast<half*>(res_out.data_ptr()) : nullptr;
     auto s = estream();
-    #define RNQ(FP8, DYN, RES) tmnq::rms_norm_quant<half, FP8, DYN, RES><<<M, 32, 0, s>>>( \
+    #define RNQ(FP8, DYN, RES) tmnq::rms_norm_quant<half, FP8, DYN, RES><<<M, 256, 0, s>>>( \
         codes.data_ptr<uint8_t>(), scale.data_ptr<float>(), rop, nqhp(x), rp, nqhp(weight), \
         D, float(eps), float(inv_static))
     if (resid) { if (fp8) { dyn ? RNQ(true,true,true) : RNQ(true,false,true); }

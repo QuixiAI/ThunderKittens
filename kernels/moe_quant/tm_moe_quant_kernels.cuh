@@ -51,30 +51,33 @@ __device__ __forceinline__ void store_scaled(float* Y, int N, int total_rows, in
 
 // ---- fp8 e4m3 weight-only grouped GEMM. B (E,N,K) e4m3 bytes, rowwise fp32
 // scale B_scale[e*N+n]. A = permuted fp16 (total_rows, K). Y (total_rows, N)
-// fp32. grid (N/16, total_rows/16). Padding tiles (expert_of_tile<0) exit. ----
+// fp32. grid (N/16, total_rows/32) — each block owns the full 32-row expert tile
+// and reuses each dequantized B fragment across both 16-row M-subtiles (halves
+// the weight load+dequant traffic). Padding tiles (expert_of_tile<0) exit. ----
 __global__ void moe_gemm_fp8(float* __restrict__ Y, const half* __restrict__ A,
                              const uint8_t* __restrict__ B, const float* __restrict__ B_scale,
                              const int* __restrict__ expert_of_tile,
                              int total_rows, int N, int K) {
-    const int n0 = blockIdx.x * 16, m0 = blockIdx.y * 16;
-    const int e = expert_of_tile[m0 / 32];
+    const int n0 = blockIdx.x * 16, m0 = blockIdx.y * 32;
+    const int e = expert_of_tile[blockIdx.y];
     if (e < 0) return;
     const uint8_t* Be = B + (size_t)e * N * K;      // fp8_raw: 1 byte/elem, (N,K)
     const float* Se = B_scale + (size_t)e * N;
     const int bpr = K / fp8_raw::block_k;           // K/128
 
-    float acc0[4] = {0, 0, 0, 0}, acc1[4] = {0, 0, 0, 0};
+    float accT0[4] = {0}, accT1[4] = {0}, accB0[4] = {0}, accB1[4] = {0};
     for (int k0 = 0; k0 < K; k0 += 16) {
-        half2 a[4], b[4];
-        load_xfrag(a, A, K, m0, k0);
-        load_wfrag<fp8_raw>(b, Be, bpr, n0, k0);
+        half2 aT[4], aB[4], b[4];
+        load_xfrag(aT, A, K, m0, k0);
+        load_xfrag(aB, A, K, m0 + 16, k0);
+        load_wfrag<fp8_raw>(b, Be, bpr, n0, k0);    // dequant once, reused by aT and aB
         half2 b0[2] = {b[0], b[2]}, b1[2] = {b[1], b[3]};
-        mma16816(acc0, a, b0);
-        mma16816(acc1, a, b1);
+        mma16816(accT0, aT, b0); mma16816(accT1, aT, b1);
+        mma16816(accB0, aB, b0); mma16816(accB1, aB, b1);
     }
     const int c0 = n0 + (threadIdx.x % 4) * 2;
-    store_scaled(Y, N, total_rows, m0, n0, acc0, acc1,
-                 Se[c0], Se[c0 + 1], Se[c0 + 8], Se[c0 + 9]);
+    store_scaled(Y, N, total_rows, m0,      n0, accT0, accT1, Se[c0], Se[c0 + 1], Se[c0 + 8], Se[c0 + 9]);
+    store_scaled(Y, N, total_rows, m0 + 16, n0, accB0, accB1, Se[c0], Se[c0 + 1], Se[c0 + 8], Se[c0 + 9]);
 }
 
 // ---- nvfp4 dual-operand grouped GEMM. A & B both fp4 e2m1 packed 2/byte
@@ -121,15 +124,18 @@ __device__ __forceinline__ void load_wfrag_nvfp4(half2 frag[4], const uint8_t* B
     }
 }
 
-// grid (N/16, total_rows/16). A_scale is a single swizzled buffer indexed by a
-// per-expert sf_offsets[e] base (in units of padded_groups). Padding tiles exit.
+// grid (N/16, total_rows/32) — 32-row block; each dequantized B fragment is
+// reused across both 16-row M-subtiles (halves the weight load+dequant). A_scale
+// is a single swizzled buffer indexed by a per-expert sf_offsets[e] base (in
+// units of padded_groups); the two subtiles differ only by loc0 (+16). Padding
+// tiles exit.
 __global__ void moe_gemm_nvfp4(float* __restrict__ Y, const uint8_t* __restrict__ A,
         const uint8_t* __restrict__ B, const uint8_t* __restrict__ A_scale,
         const uint8_t* __restrict__ B_scale, const float* __restrict__ alphas,
         const int* __restrict__ expert_of_tile, const int* __restrict__ expert_row0,
         const int* __restrict__ sf_offsets, int total_rows, int N, int K) {
-    const int n0 = blockIdx.x * 16, m0 = blockIdx.y * 16;
-    const int e = expert_of_tile[m0 / 32];
+    const int n0 = blockIdx.x * 16, m0 = blockIdx.y * 32;
+    const int e = expert_of_tile[blockIdx.y];
     if (e < 0) return;
     const int groups = K / 16, num_k_tiles = (K + 63) / 64, padded_groups = num_k_tiles * 4;
     const uint8_t* Asc_e = A_scale + (size_t)sf_offsets[e] * padded_groups;
@@ -137,17 +143,19 @@ __global__ void moe_gemm_nvfp4(float* __restrict__ Y, const uint8_t* __restrict_
     const uint8_t* Be = B + ((size_t)e * N) * (K / 2);
     const int loc0 = m0 - expert_row0[e];                   // row-in-expert of global row m0
 
-    float acc0[4] = {0, 0, 0, 0}, acc1[4] = {0, 0, 0, 0};
+    float accT0[4] = {0}, accT1[4] = {0}, accB0[4] = {0}, accB1[4] = {0};
     for (int k0 = 0; k0 < K; k0 += 16) {
-        half2 a[4], b[4];
-        load_afrag_nvfp4(a, A, Asc_e, K, num_k_tiles, m0, loc0, k0);
-        load_wfrag_nvfp4(b, Be, Bsc_e, K, groups, n0, k0);
+        half2 aT[4], aB[4], b[4];
+        load_afrag_nvfp4(aT, A, Asc_e, K, num_k_tiles, m0,      loc0,      k0);
+        load_afrag_nvfp4(aB, A, Asc_e, K, num_k_tiles, m0 + 16, loc0 + 16, k0);
+        load_wfrag_nvfp4(b, Be, Bsc_e, K, groups, n0, k0);    // dequant once, reused
         half2 b0[2] = {b[0], b[2]}, b1[2] = {b[1], b[3]};
-        mma16816(acc0, a, b0);
-        mma16816(acc1, a, b1);
+        mma16816(accT0, aT, b0); mma16816(accT1, aT, b1);
+        mma16816(accB0, aB, b0); mma16816(accB1, aB, b1);
     }
     const float al = alphas[e];
-    store_scaled(Y, N, total_rows, m0, n0, acc0, acc1, al, al, al, al);
+    store_scaled(Y, N, total_rows, m0,      n0, accT0, accT1, al, al, al, al);
+    store_scaled(Y, N, total_rows, m0 + 16, n0, accB0, accB1, al, al, al, al);
 }
 
 // ---- WNA16 (GPTQ/AWQ weight-only int4/int8) grouped GEMM. Per expert, weight
@@ -200,14 +208,17 @@ __device__ __forceinline__ void load_wfrag_wna16(half2 frag[4], const uint32_t* 
     }
 }
 
+// grid (N/16, total_rows/32) — 32-row block; the (relatively expensive) WNA16
+// de-interleave+dequant of each B fragment is reused across both 16-row
+// M-subtiles. Padding tiles exit.
 template <int BIT>
 __global__ void moe_gemm_wna16(float* __restrict__ Y, const half* __restrict__ A,
         const uint32_t* __restrict__ qweight, const half* __restrict__ scales,
         const uint8_t* __restrict__ qzeros, const int* __restrict__ expert_of_tile,
         int total_rows, int N, int K, int group_size, int has_zp) {
     constexpr int PACK = 32 / BIT;
-    const int n0 = blockIdx.x * 16, m0 = blockIdx.y * 16;
-    const int e = expert_of_tile[m0 / 32];
+    const int n0 = blockIdx.x * 16, m0 = blockIdx.y * 32;
+    const int e = expert_of_tile[blockIdx.y];
     if (e < 0) return;
     const int groups = K / group_size;
     const uint32_t* qw = qweight + (size_t)e * N * (K / PACK);
@@ -216,16 +227,18 @@ __global__ void moe_gemm_wna16(float* __restrict__ Y, const half* __restrict__ A
         ? qzeros + (BIT == 4 ? (size_t)e * ((N + 1) / 2) * groups : (size_t)e * N * groups)
         : nullptr;
 
-    float acc0[4] = {0, 0, 0, 0}, acc1[4] = {0, 0, 0, 0};
+    float accT0[4] = {0}, accT1[4] = {0}, accB0[4] = {0}, accB1[4] = {0};
     for (int k0 = 0; k0 < K; k0 += 16) {
-        half2 a[4], b[4];
-        load_xfrag(a, A, K, m0, k0);
+        half2 aT[4], aB[4], b[4];
+        load_xfrag(aT, A, K, m0, k0);
+        load_xfrag(aB, A, K, m0 + 16, k0);
         load_wfrag_wna16<BIT>(b, qw, qz, sc, N, K, groups, group_size, has_zp != 0, n0, k0);
         half2 b0[2] = {b[0], b[2]}, b1[2] = {b[1], b[3]};
-        mma16816(acc0, a, b0);
-        mma16816(acc1, a, b1);
+        mma16816(accT0, aT, b0); mma16816(accT1, aT, b1);
+        mma16816(accB0, aB, b0); mma16816(accB1, aB, b1);
     }
-    store_scaled(Y, N, total_rows, m0, n0, acc0, acc1, 1.0f, 1.0f, 1.0f, 1.0f);
+    store_scaled(Y, N, total_rows, m0,      n0, accT0, accT1, 1.0f, 1.0f, 1.0f, 1.0f);
+    store_scaled(Y, N, total_rows, m0 + 16, n0, accB0, accB1, 1.0f, 1.0f, 1.0f, 1.0f);
 }
 
 // ===========================================================================
