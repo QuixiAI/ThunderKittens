@@ -85,7 +85,7 @@ Activation-quantized paths (W8A8 at **528 GB/s**, BitNet W2A8) use native
 Marlin's: an e8m0 block scale is one `__uint_as_float(e << 23)`; fp4→fp16 is a shift and one
 power-of-two multiply.
 
-Callable from Python (`kernels/tm_cuda/`, package `tk_cuda`, **75/75** end-to-end tests):
+Callable from Python (`kernels/tm_cuda/`, package `tk_cuda`, **117/117** end-to-end tests):
 
 ```python
 import tk_cuda
@@ -106,6 +106,33 @@ LayerNorm, add-norm with fp8 epilogues, GELU, GLU ×6, cross-entropy, embedding,
 AdamW), and MoE (routing → padded grouped GEMMs → finalize), linear attention, and complex matmul.
 Every kernel is validated against an fp64 or torch-autograd oracle. Roadmap and status in
 [`thundermittens_ampere_port.md`](thundermittens_ampere_port.md).
+
+## The serving layer: MetalForge → CUDA
+
+A second, exhaustive port brings **[MetalForge](https://github.com/AlpinDale)**'s Apple-Silicon
+LLM-serving kernel set to Ampere. MetalForge is [**AlpinDale**](https://github.com/AlpinDale)'s
+([@AlpinDale](https://x.com/AlpinDale)) Metal serving layer; its "one simdgroup per row +
+`simd_*` reduction" idiom maps 1:1 onto our warp-per-row + `warp_*` reductions, so the algorithms
+port faithfully. Every family below is validated against an fp64 / round-trip / host-replay oracle
+(gap analysis in [`metalforge_gap_analysis.md`](metalforge_gap_analysis.md)):
+
+| MetalForge kernel family | what it is | CUDA/SM86 port |
+|---|---|---|
+| **Quantized MoE grouped GEMM** | fp8 rowwise · nvfp4 dual-fp4 (swizzled A-scale, per-expert α) · WNA16 int4/int8 | `kernels/moe_quant/` — mma-fragment path + fused `silu_and_mul` quant + experts-quant + scored routing (sigmoid/softplus/grouped-topk) |
+| **Norm / activation quant epilogues** | RMSNorm→fp8/int8 (static/dynamic/±residual), AZP int8, per-token-group quant | `kernels/elementwise/tm_norm_quant_kernels.cuh` |
+| **GDN gated DeltaNet** | per-token serial linear-attention recurrence, GQA + varlen + paged state | `kernels/lin_attn_tm/gdn_kernels.cuh` |
+| **Mamba selective scan** | ragged Mamba-1 scan + **APC** mid-sequence chunk checkpointing | `kernels/mamba2/selective_scan_kernels.cuh` |
+| **Sampler tail-cutoff zoo** | top-nσ · top-a · η/ε-cutoff · XTC · quadratic · skew · no-repeat-ngram · DRY | `kernels/serving/logits_proc_kernels.cuh` |
+| **EAGLE speculative decode** | rejection verify (greedy/random) + recovered-token argmax + full padded-draft bookkeeping | `kernels/serving/eagle_kernels.cuh` |
+| **Sparse attention** | 2-way LSE merge (`merge_attn_states`, + fp8 output) · tau/temperature gate · MInference vertical/slash builder | `kernels/serving/sparse_serving_kernels.cuh` |
+| **DeepSeek lightning-indexer** | fp8 K-quant-and-cache (per-block UE8M0 scale) + the `cp_gather` inverse | `kernels/serving/sparse_serving_kernels.cuh` |
+| **TurboQuant codec** | random-sign FWHT rotation (self-inverse) + `tq_encode` K-uniform / V-centroid cache codec | `kernels/quant/turboquant.cuh` |
+| **LoRA / act-order** | per-LoRA-sharded MoE align + GPTQ column permute | `kernels/quant/turboquant.cuh` |
+
+The quantized MoE GEMMs go straight to the tensor-core mma-fragment path (not a scalar
+correctness pass) — the same Marlin dequant discipline the weight-only GEMMs use, now feeding the
+per-expert padded schedule. `dp4a`/IMMA-backed int paths again *exceed* the Metal original on
+hardware Apple never had.
 
 ## Quick start
 
@@ -162,6 +189,11 @@ Papers: [Single GPU](https://arxiv.org/abs/2410.20399) ·
 - [ThunderMittens](https://github.com/QuixiAI/ThunderMittens) — the Apple Metal port whose
   kernels and format layer this fork brings to CUDA, and the proof that "none of this was
   supposed to work" is a solvable condition.
+- **[AlpinDale](https://github.com/AlpinDale)** ([@AlpinDale](https://x.com/AlpinDale)) — author of
+  **MetalForge**, the Apple-Silicon LLM-serving kernel layer that inspired the entire serving-layer
+  port above: quantized MoE GEMMs, the sampler zoo, EAGLE, GDN, Mamba selective scan, MInference /
+  lightning-indexer sparse attention, and the TurboQuant cache codec. Every one of those families
+  is a direct CUDA transcription of AlpinDale's Metal kernels.
 - [Marlin](https://github.com/IST-DASLab/marlin) (IST-DASLab / Neural Magic) — the dequant bit
   tricks and the placement discipline that make quantized compute free on "unsupported" hardware.
 

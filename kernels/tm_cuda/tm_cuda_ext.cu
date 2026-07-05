@@ -323,6 +323,7 @@ void init_moe_quant(pybind11::module_& m);     // tm_cuda_moe_quant.cu
 void init_m4(pybind11::module_& m);            // tm_cuda_m4.cu
 void init_m5(pybind11::module_& m);            // tm_cuda_m5.cu
 void init_m6(pybind11::module_& m);            // tm_cuda_m6.cu
+void init_mf_followups(pybind11::module_& m);  // tm_cuda_mf_followups.cu
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     init_serving(m);
@@ -332,6 +333,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     init_m4(m);
     init_m5(m);
     init_m6(m);
+    init_mf_followups(m);
     m.def("qgemv", &py_qgemv, "D(N) = dequant(Wq) @ x, fp16 x");
     m.def("qgemm", &py_qgemm, "Y(M,N) = X(M,K) @ dequant(Wq)^T");
     m.def("qflux_gelu", &py_qflux_gelu, "gelu_tanh(X @ dequant(Wq)^T + bias)");

@@ -59,6 +59,42 @@ __global__ void merge_attn_states(T* __restrict__ output, float* __restrict__ ou
     if (hidden == 0) output_lse[lse_idx] = logf(z) + m;
 }
 
+// ---- fp8-output 2-way LSE merge (MetalForge merge_attn_states_fp8): same
+// combine as merge_attn_states but writes e4m3 codes scaled by 1/output_scale.
+// Layout matches merge_attn_states (tokens, heads, head_size); lse (tokens,
+// heads) stays fp32. One thread per (token, head, hidden). ----
+template <typename T>
+__global__ void merge_attn_states_fp8(uint8_t* __restrict__ output, float* __restrict__ output_lse,
+        const T* __restrict__ prefix_out, const float* __restrict__ prefix_lse,
+        const T* __restrict__ suffix_out, const float* __restrict__ suffix_lse,
+        int num_heads, int head_size, int num_tokens, int prefix_num_tokens, float output_scale) {
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long total = (long)num_tokens * num_heads * head_size;
+    if (idx >= total) return;
+    const int hidden = idx % head_size;
+    const int head = (idx / head_size) % num_heads;
+    const int token = idx / ((long)head_size * num_heads);
+    const long lse_idx = (long)token * num_heads + head;
+    const float scale_inv = 1.0f / output_scale;
+
+    if (token >= prefix_num_tokens) {                 // suffix-only tail
+        output[idx] = tmq::e4m3_encode(pf(suffix_out[idx]) * scale_inv);
+        if (hidden == 0) output_lse[lse_idx] = suffix_lse[lse_idx];
+        return;
+    }
+    const float pl = prefix_lse[lse_idx], sl = suffix_lse[lse_idx];
+    const float m = fmaxf(pl, sl);
+    if (isinf(m)) {
+        output[idx] = tmq::e4m3_encode(pf(prefix_out[idx]) * scale_inv);
+        if (hidden == 0) output_lse[lse_idx] = m;
+        return;
+    }
+    const float pse = expf(pl - m), sse = expf(sl - m), z = pse + sse;
+    const float v = pf(prefix_out[idx]) * (pse / z) + pf(suffix_out[idx]) * (sse / z);
+    output[idx] = tmq::e4m3_encode(v * scale_inv);
+    if (hidden == 0) output_lse[lse_idx] = logf(z) + m;
+}
+
 // ---- tau/temperature Q/V gate (MetalForge tau_tail): packed qkv (tokens,
 // 3*q_dim); scales the Q slice by tanh(tok_q_lin)+tau_pos[pos,head] and the V
 // slice by tanh(tok_v_lin)+tau_pos (K untouched). tok_qv_lin (tokens, 2*heads).
@@ -117,6 +153,48 @@ __global__ void indexer_k_quant_and_cache(const T* __restrict__ k, uint8_t* __re
     }
 }
 
+// ---- lightning-indexer gather (MetalForge cp_gather_indexer_k_quant_cache):
+// the inverse of indexer_k_quant_and_cache. For each cached token, binary-search
+// its batch in cu_seq_lens, walk block_table to the paged slot, and copy the fp8
+// K codes + the per-block scale out to a dense (num_tokens, head_dim) destination.
+// One warp per (token, qblock); dst_scale is fp32 at token_stride/quant_block_size
+// granularity. ----
+static __global__ void cp_gather_indexer_k_quant_cache(const uint8_t* __restrict__ kv_cache,
+        uint8_t* __restrict__ dst_k, uint8_t* __restrict__ dst_scale,
+        const int* __restrict__ block_table, const int* __restrict__ cu_seq_lens,
+        int batch_size, long token_stride, int head_dim, long block_stride,
+        int cache_block_size, int num_blocks, int num_tokens, int quant_block_size) {
+    const int token = blockIdx.x, qblock = blockIdx.y, lane = threadIdx.x, threads = blockDim.x;
+    const int start = qblock * quant_block_size;
+    if (token >= num_tokens || start >= head_dim) return;
+
+    int batch = -1, lo = 0, hi = batch_size - 1;      // batch owning this token
+    while (lo <= hi) {
+        const int mid = (lo + hi) >> 1;
+        if (cu_seq_lens[mid + 1] <= token) lo = mid + 1;
+        else if (cu_seq_lens[mid] > token) hi = mid - 1;
+        else { batch = mid; break; }
+    }
+    if (batch < 0) return;
+
+    const int inbatch = token - cu_seq_lens[batch];
+    const int bti = inbatch / cache_block_size;
+    if (bti >= num_blocks) return;
+    const int block = block_table[batch * num_blocks + bti];
+    const int slot = inbatch - bti * cache_block_size;
+    const long cache_off = (long)block * block_stride + (long)slot * head_dim + start;
+    const long dst_off = (long)token * token_stride + start;
+
+    for (int i = lane; i < quant_block_size && start + i < head_dim; i += threads)
+        dst_k[dst_off + i] = kv_cache[cache_off + i];
+    if (lane == 0) {
+        const long src_scale_off = (long)block * block_stride + (long)cache_block_size * head_dim
+                                 + ((long)slot * head_dim + start) * 4 / quant_block_size;
+        const float scale = *reinterpret_cast<const float*>(kv_cache + src_scale_off);
+        reinterpret_cast<float*>(dst_scale)[((long)token * token_stride + start) / quant_block_size] = scale;
+    }
+}
+
 // ---- MInference vertical/slash sparse-index builder
 // (convert_vertical_slash_indexes): per (head, batch, M-block), a serial
 // two-pointer merge of the vertical-index and slash/diagonal-index lists into
@@ -131,7 +209,7 @@ __device__ __forceinline__ int vs_save_blocks(int* block_offset, int rs, int re,
     for (int idx = rs; idx < re; idx += bs) block_offset[c++] = idx;
     return c;
 }
-__global__ void convert_vertical_slash_indexes(
+static __global__ void convert_vertical_slash_indexes(
         const int* __restrict__ q_seqlens, const int* __restrict__ kv_seqlens,
         const int* __restrict__ vertical_indexes, const int* __restrict__ slash_indexes,
         int* __restrict__ block_count, int* __restrict__ block_offset,
