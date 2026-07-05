@@ -22,6 +22,11 @@ __device__ __forceinline__ float warp_max_f(float v) {
     for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
     return v;
 }
+__device__ __forceinline__ float warp_min_f(float v) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v = fminf(v, __shfl_xor_sync(0xffffffffu, v, off));
+    return v;
+}
 __device__ __forceinline__ int warp_sum_i32(int v) {
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
@@ -107,6 +112,32 @@ __device__ inline int block_exclusive_scan_i32(int val, unsigned tid, unsigned n
     }
     total = t;
     return base + (incl - val);
+}
+
+/// Float INCLUSIVE prefix sum of `val` across the block's first nthreads
+/// threads (multiple of 32). sg_sums: shared scratch >= nthreads/32 floats.
+/// Returns the inclusive scan (running sum through and including this thread);
+/// `total` = block sum on every thread. Contains a __syncthreads. For the
+/// skew-transform sampler (CDF over a probability row).
+__device__ inline float block_inclusive_scan_f(float val, unsigned tid, unsigned nthreads,
+                                               float* sg_sums, float& total) {
+    const unsigned lane = tid % 32, sg = tid / 32, nsg = (nthreads + 31) / 32;
+    float incl = val;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const float up = __shfl_up_sync(0xffffffffu, incl, off);
+        if (lane >= unsigned(off)) incl += up;
+    }
+    if (lane == 31) sg_sums[sg] = incl;
+    __syncthreads();
+    float base = 0.0f, t = 0.0f;
+    for (unsigned i = 0; i < nsg; i++) {
+        const float s = sg_sums[i];
+        if (i < sg) base += s;
+        t += s;
+    }
+    total = t;
+    return base + incl;
 }
 
 }  // namespace tms

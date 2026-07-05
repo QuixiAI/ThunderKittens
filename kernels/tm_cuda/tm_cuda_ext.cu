@@ -60,15 +60,28 @@ static torch::Tensor qmm_impl(torch::Tensor X, torch::Tensor Wq, const std::stri
         TORCH_CHECK(bias.has_value() && bias->scalar_type() == torch::kFloat, "flux needs fp32 bias");
         bp = bias->data_ptr<float>();
     }
+    // Decode shapes (small M) leave most SMs idle in the warp-per-tile grid;
+    // route the plain GEMM through qgemm_ksplit (K sliced across blockIdx.z,
+    // fp32 atomic combine into a zeroed Y). FLUX keeps the single-pass grid —
+    // its bias+gelu epilogue can't ride the partial-sum accumulation.
+    const long tiles = long(N / 16) * ((M + 15) / 16);
+    const bool use_ksplit = !FLUX && tiles < 832;   // < ~half the 82-SM chip
     torch::Tensor Wf;   // keep alive
     auto launch = [&](const uint8_t* w, auto fmt_tag) {
         using FMT = decltype(fmt_tag);
-        if constexpr (FLUX)
+        if constexpr (FLUX) {
             qflux_gelu<FMT><<<grid, 32, 0, stream>>>(Y.data_ptr<float>(),
                 reinterpret_cast<const half*>(X.data_ptr()), w, bp, M, N, K);
-        else
+        } else if (use_ksplit) {
+            const int chunk = qgemm_pick_kchunk(M, N, K, FMT::block_k);
+            dim3 gz(N / 16, (M + 15) / 16, (K + chunk - 1) / chunk);
+            cudaMemsetAsync(Y.data_ptr<float>(), 0, sizeof(float) * size_t(M) * N, stream);
+            qgemm_ksplit<FMT><<<gz, 32, 0, stream>>>(Y.data_ptr<float>(),
+                reinterpret_cast<const half*>(X.data_ptr()), w, M, N, K, chunk);
+        } else {
             qgemm<FMT><<<grid, 32, 0, stream>>>(Y.data_ptr<float>(),
                 reinterpret_cast<const half*>(X.data_ptr()), w, M, N, K);
+        }
     };
 #define X(F) if (fmt == #F) { \
         if constexpr (F::block_k > 64) { \
@@ -82,7 +95,33 @@ static torch::Tensor qmm_impl(torch::Tensor X, torch::Tensor Wq, const std::stri
 #undef X
     TORCH_CHECK(false, "unknown quant format: ", fmt);
 }
+// Dequant W (any format) to a fresh fp16 (N,K) buffer.
+static torch::Tensor dequant_weights_fp16(torch::Tensor Wq, const std::string& fmt,
+                                          int N, int K, cudaStream_t stream,
+                                          const torch::TensorOptions& opts) {
+    auto Wf = torch::empty({N, K}, opts.dtype(torch::kHalf));
+    const int blocks = int((size_t(N) * K + 255) / 256);
+#define X(F) if (fmt == #F) { dequant_to_fp16<F><<<blocks, 256, 0, stream>>>( \
+        reinterpret_cast<half*>(Wf.data_ptr()), Wq.data_ptr<uint8_t>(), N, K); return Wf; }
+    TMQ_FORMATS(X)
+#undef X
+    TORCH_CHECK(false, "unknown quant format: ", fmt);
+}
+
 torch::Tensor py_qgemm(torch::Tensor X, torch::Tensor Wq, const std::string& fmt) {
+    CHECK_CUDA_T(X); CHECK_CUDA_T(Wq);
+    TORCH_CHECK(X.scalar_type() == torch::kHalf, "X must be fp16");
+    const int M = X.size(0), K = X.size(1), N = Wq.size(0);
+    // Prefill (M >= 64): the naive per-tile kernel is ~7 TFLOP/s; dequant W to
+    // fp16 once and hand the GEMM to cuBLAS (torch::matmul) — ~40-62 TFLOP/s,
+    // a 6-8x win. The full-W materialization is amortized across the M rows;
+    // decode (M<64) never takes this path (it uses GEMV / ksplit, which move
+    // ~4x less weight memory and don't want an fp16 blow-up of W).
+    if (M >= 64) {
+        auto stream = at::cuda::getCurrentCUDAStream();
+        auto Wf = dequant_weights_fp16(Wq, fmt, N, K, stream, X.options());
+        return torch::matmul(X, Wf.t()).to(torch::kFloat);
+    }
     return qmm_impl<false>(X, Wq, fmt, c10::nullopt);
 }
 torch::Tensor py_qflux_gelu(torch::Tensor X, torch::Tensor Wq, torch::Tensor bias, const std::string& fmt) {
@@ -280,11 +319,15 @@ torch::Tensor py_qgemm_blockscale(torch::Tensor X, torch::Tensor Wq, torch::Tens
 void init_serving(pybind11::module_& m);       // tm_cuda_serving.cu
 void init_elementwise(pybind11::module_& m);   // tm_cuda_elementwise.cu
 void init_w6(pybind11::module_& m);            // tm_cuda_w6.cu
+void init_moe_quant(pybind11::module_& m);     // tm_cuda_moe_quant.cu
+void init_m4(pybind11::module_& m);            // tm_cuda_m4.cu
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     init_serving(m);
     init_elementwise(m);
     init_w6(m);
+    init_moe_quant(m);
+    init_m4(m);
     m.def("qgemv", &py_qgemv, "D(N) = dequant(Wq) @ x, fp16 x");
     m.def("qgemm", &py_qgemm, "Y(M,N) = X(M,K) @ dequant(Wq)^T");
     m.def("qflux_gelu", &py_qflux_gelu, "gelu_tanh(X @ dequant(Wq)^T + bias)");

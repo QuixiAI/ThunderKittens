@@ -67,6 +67,51 @@ equivalent like TM did, adjusted for 3090's compute/bandwidth ratio).
   reference must replay the kernel's HALF code*scale multiply (random e4m3
   codes reach +-448 — fp32-ref rounding gap exceeds tolerance).
 
+- 2026-07-04 STEP 5 CANONICAL SWEEP (idle 3090, external job cleared).
+  perf/sweep_quant.sh over all 29 formats, N=512 K=4096. GEMV GB/s:
+    q8_0 283, e5m2 288, mxfp8 254, fp8_e4m3 260, fp8_block 252,
+    q6_K 212, mxfp6 201/200, q5_0 171, q4_1 160, q5_1 156, q4_0 156,
+    q4_K 152, q5_K 143, nvfp4 141, mxfp4 136, kU4/kU4B8 137/135, hqq 145,
+    fp4_e2m1 146, bitnet 91, q2_K 91, iq4_nl 71, q3_K 59, iq4_xs 59,
+    iq3_xxs 48, iq2_xxs 36, iq2_xs 15, iq1_s 15.
+  IMPORTANT CORRECTION: the "2.7x vs torch" from the contended run was an
+  ARTIFACT — idle cuBLAS GEMV scales to ~714 GB/s (near the 936 peak), so
+  the CANONICAL M=1 N=K=4096 advantage is ~1.4x for 4-bit (q4_0 1.48x,
+  q4_K 1.42x, nvfp4 1.33x); mxfp8 0.93x, iq4_nl 0.16x (codebook-bound).
+  Honest story: 4-bit quant GEMV beats fp16 torch at decode by moving ~4x
+  less weight memory, but our GEMV isn't at peak bandwidth (dequant cost).
+  ksplit at the decode shape (idle): q8_0 3.16->7.11, q4_0 2.67->7.08,
+  nvfp4 2.00->6.82, mxfp4 2.33->7.00, q4_K 2.58->5.63, iq2_xxs 2.50->5.09
+  TFLOP/s (~2.4x over single-pass). All bit-exact. README + this ledger
+  corrected to the canonical numbers (the 2.7x line is gone).
+- 2026-07-04 STEP 5 PREFILL ROUTE (closes the M>=64 gap the cheap way): the
+  qgemm binding now, for M>=64, dequants W to a fp16 (N,K) buffer once
+  (dequant_to_fp16<FMT>, all formats) and hands the GEMM to cuBLAS via
+  torch::matmul — the whole-W materialization is amortized across the M rows.
+  End-to-end (dequant included) at M=256 N=K=4096: q8_0 29.5, q4_0 29.6,
+  nvfp4 28.5, mxfp4 29.2, q4_K 27.7 TFLOP/s (iq2_xxs 14.6 — codebook dequant
+  bound) vs the old naive 7-9 = ~4x. cuBLAS-only is 40-62 TFLOP/s; the
+  dequant pass is the remaining overhead. Decode (M<64) still uses GEMV /
+  ksplit (no fp16 W blow-up). rel < 0.035% all formats; pytest 29/29 quant
+  (+3 test_qgemm_prefill M=128), 78/78 total. This is the pragmatic answer
+  to "cp.async ring" — cuBLAS IS the tuned ring; a hand-written fused
+  dequant-in-pipeline ring could save the separate dequant pass (~40->60
+  TFLOP/s) but is a large effort for a secondary (prefill) path. STEP 5 DONE.
+
+- 2026-07-04 STEP 5 PERF (part 2): qgemm_ksplit (decode-shape occupancy fix).
+  The warp-per-16x16-tile qgemm is only (N/16)*(M/16) warps — at M=64,N=512
+  that's 128 warps, half the 82-SM chip idle with no latency hiding. ksplit
+  slices the K axis across blockIdx.z (each warp reduces [k_beg,k_end),
+  atomicAdd fp32 partials into a zeroed Y), aligned to the format block so a
+  slice never splits a block. All 29 formats bit-exact (qgemm + ksplit PASS).
+  Under CONTENTION (all 8 GPUs busy), decode shape M=64 N=512 K=4096:
+  q8_0 2.2->8.0, q4_0 1.5->8.1, mxfp4 1.4->8.0, nvfp4 0.57->2.6,
+  q4_K 0.66->2.0, iq2_xxs 1.4->2.8 TFLOP/s (3-6x). Binding auto-routes the
+  plain qgemm through ksplit when the tile count < ~half the chip (832);
+  FLUX keeps the single-pass grid (bias+gelu epilogue can't ride the
+  partial-sum accumulate). Consolidated in tm_kernels.cuh (tmq::qgemm_ksplit
+  + qgemm_pick_kchunk) + standalone qgemm.cu harness.
+
 - 2026-07-04 STEP 5 PERF (part 1, correctness-gated): dequant8 SPAN
   SPECIALIZATIONS landed for 15 formats (q8_0 q4_0 mxfp8 mxfp4 nvfp4
   fp4_e2m1 mxfp6 both + q2_K q3_K q4_K q5_K q6_K + iq4_nl iq4_xs iq2_xxs

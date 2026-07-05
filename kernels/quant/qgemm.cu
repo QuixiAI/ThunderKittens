@@ -78,6 +78,56 @@ __global__ void dequant_to_fp16(half* out, const uint8_t* Wq, int N, int K) {
     out[idx] = __float2half(FMT::dequant(base, col % FMT::block_k));
 }
 
+// ---- ksplit variant (perf pass): at decode shapes the warp-per-tile grid is
+// only (N/16)*(M/16) warps — half the SMs idle at M=64,N=512. Slice K across
+// blockIdx.z and atomicAdd fp32 partials into a zeroed Y. Same fragment math.
+// (Also consolidated in tm_kernels.cuh as tmq::qgemm_ksplit.) ----
+template<typename FMT>
+__global__ void qgemm_ksplit(float* Y, const half* X, const uint8_t* Wq,
+                             int M, int N, int K, int k_chunk) {
+    const int n0 = blockIdx.x * 16;
+    const int m0 = blockIdx.y * 16;
+    const int k_beg = blockIdx.z * k_chunk;
+    const int k_end = min(K, k_beg + k_chunk);
+    const int bpr = K / FMT::block_k;
+
+    float acc0[4] = {0, 0, 0, 0};
+    float acc1[4] = {0, 0, 0, 0};
+    for (int k0 = k_beg; k0 < k_end; k0 += 16) {
+        half2 a[4], b[4];
+        load_xfrag(a, X, K, m0, k0);
+        load_wfrag<FMT>(b, Wq, bpr, n0, k0);
+        half2 b0[2] = {b[0], b[2]};
+        half2 b1[2] = {b[1], b[3]};
+        mma16816(acc0, a, b0);
+        mma16816(acc1, a, b1);
+    }
+    const int lane = threadIdx.x & 31;
+    const int r = m0 + lane / 4, c0 = n0 + (lane % 4) * 2;
+    if (r < M) {
+        atomicAdd(&Y[size_t(r) * N + c0],         acc0[0]);
+        atomicAdd(&Y[size_t(r) * N + c0 + 1],     acc0[1]);
+        atomicAdd(&Y[size_t(r) * N + c0 + 8],     acc1[0]);
+        atomicAdd(&Y[size_t(r) * N + c0 + 8 + 1], acc1[1]);
+    }
+    if (r + 8 < M) {
+        atomicAdd(&Y[size_t(r + 8) * N + c0],         acc0[2]);
+        atomicAdd(&Y[size_t(r + 8) * N + c0 + 1],     acc0[3]);
+        atomicAdd(&Y[size_t(r + 8) * N + c0 + 8],     acc1[2]);
+        atomicAdd(&Y[size_t(r + 8) * N + c0 + 8 + 1], acc1[3]);
+    }
+}
+
+static inline int qgemm_pick_kchunk(int M, int N, int K, int block_k) {
+    const long tiles = long((N + 15) / 16) * ((M + 15) / 16);
+    const int target = 1664;                      // ~82 SMs x 20 warps
+    int splits = int((target + tiles - 1) / tiles);
+    const int align = (block_k > 16) ? block_k : 16;
+    int chunk = ((K / (splits > 0 ? splits : 1)) + align - 1) / align * align;
+    if (chunk < align) chunk = align;
+    return chunk;
+}
+
 // ---- harness ----
 static std::vector<uint8_t> read_file(const std::string& p) {
     FILE* f = fopen(p.c_str(), "rb");
@@ -137,7 +187,43 @@ int run(const std::string& dir, int N, int K) {
     printf("qgemm%s: rel %.4f%% max %.4g | %.3f ms  %.2f TFLOP/s  (%s)\n",
            SUPERBLOCK ? "[dequant-route]" : "", 100 * rel, gmax, ms, tflop / (ms / 1e3),
            rel < 0.02 ? "PASS" : "FAIL");
-    return rel < 0.02 ? 0 : 1;
+    int rc = rel < 0.02 ? 0 : 1;
+
+    // ---- ksplit variant: K sliced across blockIdx.z + fp32 atomic combine ----
+    {
+        const int chunk = qgemm_pick_kchunk(M, N, K, SUPERBLOCK ? 16 : FMT::block_k);
+        const int splits = (K + chunk - 1) / chunk;
+        dim3 gridz(N / 16, (M + 15) / 16, splits);
+        auto launch2 = [&] {
+            cudaMemsetAsync(dY, 0, sizeof(float) * size_t(M) * N);
+            if constexpr (SUPERBLOCK) {
+                dequant_to_fp16<FMT><<<(N * K + 255) / 256, 256>>>(dWf, dWq, N, K);
+                qgemm_ksplit<fp16_raw><<<gridz, 32>>>(dY, dX,
+                    reinterpret_cast<const uint8_t*>(dWf), M, N, K, chunk);
+            } else {
+                qgemm_ksplit<FMT><<<gridz, 32>>>(dY, dX, dWq, M, N, K, chunk);
+            }
+        };
+        launch2();
+        cudaDeviceSynchronize();
+        if (cudaGetLastError() != cudaSuccess) { printf("KSPLIT KERNEL ERROR\n"); return 1; }
+        cudaEventRecord(t0);
+        for (int i = 0; i < iters; i++) launch2();
+        cudaEventRecord(t1); cudaEventSynchronize(t1);
+        cudaEventElapsedTime(&ms, t0, t1); ms /= iters;
+        cudaMemcpy(got.data(), dY, sizeof(float) * got.size(), cudaMemcpyDeviceToHost);
+        gsum = 0; rsum = 0; gmax = 0;
+        for (size_t i = 0; i < got.size(); i++) {
+            double d = std::abs(double(got[i]) - double(ref[i]));
+            gmax = std::max(gmax, d); gsum += d; rsum += std::abs(double(ref[i]));
+        }
+        rel = gsum / std::max(rsum, 1e-30);
+        printf("qgemm-ksplit(x%d)%s: rel %.4f%% max %.4g | %.3f ms  %.2f TFLOP/s  (%s)\n",
+               splits, SUPERBLOCK ? "[dequant-route]" : "", 100 * rel, gmax, ms,
+               tflop / (ms / 1e3), rel < 0.02 ? "PASS" : "FAIL");
+        rc |= !(rel < 0.02);
+    }
+    return rc;
 }
 
 int main(int argc, char** argv) {

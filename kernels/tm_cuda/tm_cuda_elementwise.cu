@@ -2,6 +2,7 @@
 // validated kernels in kernels/elementwise/tm_elementwise_kernels.cuh.
 // Registered into the _C module by init_elementwise(m) from tm_cuda_ext.cu.
 #include "../elementwise/tm_elementwise_kernels.cuh"
+#include "../elementwise/tm_norm_quant_kernels.cuh"   // MF-M2 norm/AZP/group quant
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
@@ -367,6 +368,61 @@ static torch::Tensor py_add(torch::Tensor x, torch::Tensor y) {
     return o;
 }
 
+// ---- MF-M2: norm+quant epilogues, AZP int8, group int8 (half input) ----
+static const half* nqhp(const torch::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); }
+
+// rms_norm_quant -> (codes u8, scale f32 [dyn], res_out [resid]).
+static std::vector<torch::Tensor> py_rms_norm_quant(torch::Tensor x, torch::Tensor weight,
+        bool fp8, bool dyn, double eps, double inv_static, c10::optional<torch::Tensor> residual) {
+    ECK(x); ECK(weight);
+    const int D = x.size(-1), M = rows_of(x);
+    const bool resid = residual.has_value();
+    if (resid) ECK((*residual));
+    auto codes = torch::empty(x.sizes(), x.options().dtype(torch::kUInt8));
+    auto scale = torch::empty({dyn ? M : 1}, x.options().dtype(torch::kFloat));
+    auto res_out = resid ? torch::empty_like(x) : torch::empty({0}, x.options());
+    const half* rp = resid ? nqhp(*residual) : nullptr;
+    half* rop = resid ? reinterpret_cast<half*>(res_out.data_ptr()) : nullptr;
+    auto s = estream();
+    #define RNQ(FP8, DYN, RES) tmnq::rms_norm_quant<half, FP8, DYN, RES><<<M, 32, 0, s>>>( \
+        codes.data_ptr<uint8_t>(), scale.data_ptr<float>(), rop, nqhp(x), rp, nqhp(weight), \
+        D, float(eps), float(inv_static))
+    if (resid) { if (fp8) { dyn ? RNQ(true,true,true) : RNQ(true,false,true); }
+                 else      { dyn ? RNQ(false,true,true) : RNQ(false,false,true); } }
+    else       { if (fp8) { dyn ? RNQ(true,true,false) : RNQ(true,false,false); }
+                 else      { dyn ? RNQ(false,true,false) : RNQ(false,false,false); } }
+    #undef RNQ
+    std::vector<torch::Tensor> out = {codes};
+    if (dyn) out.push_back(scale);
+    if (resid) out.push_back(res_out);
+    return out;
+}
+static std::vector<torch::Tensor> py_azp_int8_quant(torch::Tensor x, bool dyn,
+        double scale_static, int64_t azp_static) {
+    ECK(x);
+    const int D = x.size(-1), M = rows_of(x);
+    auto codes = torch::empty(x.sizes(), x.options().dtype(torch::kChar));
+    auto scale = torch::empty({dyn ? M : 1}, x.options().dtype(torch::kFloat));
+    auto azp = torch::empty({dyn ? M : 1}, x.options().dtype(torch::kInt));
+    auto s = estream();
+    if (dyn) tmnq::azp_int8_quant<half, true><<<M, 32, 0, s>>>(codes.data_ptr<int8_t>(),
+        scale.data_ptr<float>(), azp.data_ptr<int>(), nqhp(x), D, 0, 0);
+    else tmnq::azp_int8_quant<half, false><<<M, 32, 0, s>>>(codes.data_ptr<int8_t>(),
+        scale.data_ptr<float>(), azp.data_ptr<int>(), nqhp(x), D, float(scale_static), int(azp_static));
+    return {codes, scale, azp};
+}
+static std::tuple<torch::Tensor, torch::Tensor> py_per_token_group_int8(torch::Tensor x,
+        int64_t group_size, double eps) {
+    ECK(x);
+    const int H = x.size(-1), T = rows_of(x), NG = H / int(group_size);
+    auto codes = torch::empty(x.sizes(), x.options().dtype(torch::kChar));
+    auto scales = torch::empty({T, NG}, x.options().dtype(torch::kFloat));
+    dim3 g(NG, T);
+    tmnq::per_token_group_int8_quant<half><<<g, 32, 0, estream()>>>(codes.data_ptr<int8_t>(),
+        scales.data_ptr<float>(), nqhp(x), H, int(group_size), NG, float(eps));
+    return {codes, scales};
+}
+
 void init_elementwise(py::module_& m) {
     m.def("rms_norm", &py_rms_norm, py::arg("x"), py::arg("w"), py::arg("eps") = 1e-5);
     m.def("rms_norm_bwd_dx", &py_rms_norm_bwd_dx);
@@ -418,4 +474,12 @@ void init_elementwise(py::module_& m) {
           py::arg("lr"), py::arg("beta1") = 0.9, py::arg("beta2") = 0.999,
           py::arg("eps") = 1e-8, py::arg("wd") = 0.0, py::arg("step") = 1);
     m.def("add", &py_add);
+    // MF-M2 norm/AZP/group quant
+    m.def("rms_norm_quant", &py_rms_norm_quant, py::arg("x"), py::arg("weight"),
+          py::arg("fp8") = true, py::arg("dyn") = true, py::arg("eps") = 1e-5,
+          py::arg("inv_static") = 1.0, py::arg("residual") = py::none());
+    m.def("azp_int8_quant", &py_azp_int8_quant, py::arg("x"), py::arg("dyn") = true,
+          py::arg("scale_static") = 1.0, py::arg("azp_static") = 0);
+    m.def("per_token_group_int8_quant", &py_per_token_group_int8, py::arg("x"),
+          py::arg("group_size"), py::arg("eps") = 1e-6);
 }

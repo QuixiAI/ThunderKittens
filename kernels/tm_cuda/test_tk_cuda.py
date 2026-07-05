@@ -48,6 +48,18 @@ def test_qgemm(fmt):
     assert rel < 2e-2, rel
 
 
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_K", "iq2_xxs"])
+def test_qgemm_prefill(fmt):
+    # M>=64 routes through dequant-to-fp16 + cuBLAS (torch.matmul); same result
+    Wq, wdeq = _pack(fmt)
+    Mp = 128
+    X = RNG.standard_normal((Mp, K)).astype(np.float16)
+    ref = X.astype(np.float32) @ wdeq.T
+    y = tk_cuda.qgemm(torch.from_numpy(X).cuda(), Wq, fmt).cpu().numpy()
+    rel = np.abs(y - ref).sum() / max(np.abs(ref).sum(), 1e-30)
+    assert rel < 2e-2, rel
+
+
 @pytest.mark.parametrize("fmt", ["q4_0", "nvfp4"])
 def test_qflux_gelu(fmt):
     Wq, wdeq = _pack(fmt)

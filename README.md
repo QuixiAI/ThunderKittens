@@ -68,13 +68,24 @@ quantized checkpoint serves Metal and CUDA. Every format's GPU dequant is **bit-
 | ternary | bitnet **(2.5 bpw)** |
 
 Every format runs through the whole kernel family — dequant, GEMV, GEMM (Marlin zero-shuffle
-fragment path: format → mma fragment in registers, no shared staging), fused GEMM+GELU, and a
-fused LM-head sampler. Activation-quantized paths (W8A8 at **528 GB/s**, BitNet W2A8) use native
+fragment path: format → mma fragment in registers, no shared staging; a `qgemm_ksplit` variant
+slices K across the grid for decode-shape occupancy — **~2.4× over the single-pass kernel** at
+`M=64, N=512, K=4096`, e.g. q8_0 3.16 → 7.11 TFLOP/s), fused GEMM+GELU, GPTQ act-order and
+block-scale GEMMs, and a fused LM-head sampler (argmax / categorical / top-k / top-p). At the
+decode-critical **M=1 GEMV** — where quant serving actually lives — the quantized path is
+**~1.4× faster than `torch.matmul` fp16** for ≥4-bit formats (q4_0 1.48×, q4_K 1.42×; it moves
+~4× less weight memory). Weight-only GEMV bandwidth on idle 3090 (N=512, K=4096): q8_0 **283 GB/s**,
+q6_K 212, q5_0 171, q4_0 156, mxfp8 254, nvfp4 141; the E8-lattice i-quants trail at 15–71 GB/s
+(divergent codebook gathers — the span-decode pass cut the re-lookups 8×, but they stay
+lookup-bound). At **prefill (M ≥ 64)** the GEMM dequants the weight to fp16 once and hands the
+matmul to cuBLAS — **~28–30 TFLOP/s** end-to-end (q8_0/q4_0/nvfp4 at M=256, dequant included),
+vs ~7–9 for the naive per-tile kernel, so a batched quantized forward runs at cuBLAS-class speed.
+Activation-quantized paths (W8A8 at **528 GB/s**, BitNet W2A8) use native
 `dp4a` — hardware Apple never had, so this port *exceeds* the original. The dequant recipes are
 Marlin's: an e8m0 block scale is one `__uint_as_float(e << 23)`; fp4→fp16 is a shift and one
 power-of-two multiply.
 
-Callable from Python (`kernels/tm_cuda/`, package `tk_cuda`, 26/26 end-to-end tests):
+Callable from Python (`kernels/tm_cuda/`, package `tk_cuda`, **75/75** end-to-end tests):
 
 ```python
 import tk_cuda
@@ -87,8 +98,13 @@ Sampling is driven by a counter-based RNG with **proven bit-parity** to its nump
 the fused GPU draw equals the reference draw exactly, so stochastic kernels have deterministic
 oracles.
 
-The serving stack (paged attention, quantized KV cache, MLA decode, speculative decoding, the
-full sampler family) is being ported next — roadmap in
+The rest of the ThunderMittens stack is **ported and live** — the serving path (paged attention
+v1/v2, quantized + fp8 KV cache, MLA decode incl. bf16/fp8/sparse/partitioned, RoPE insert,
+sliding-window and GQA-staged attention, varlen prefill), the decode stack (full sampler family,
+beam search, speculative + tree verification), the elementwise/norm/training family (RMSNorm,
+LayerNorm, add-norm with fp8 epilogues, GELU, GLU ×6, cross-entropy, embedding, dropout, hadamard,
+AdamW), and MoE (routing → padded grouped GEMMs → finalize), linear attention, and complex matmul.
+Every kernel is validated against an fp64 or torch-autograd oracle. Roadmap and status in
 [`thundermittens_ampere_port.md`](thundermittens_ampere_port.md).
 
 ## Quick start

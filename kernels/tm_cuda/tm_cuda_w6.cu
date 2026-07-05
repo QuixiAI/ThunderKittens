@@ -3,6 +3,8 @@
 // Registered by init_w6(m) from tm_cuda_ext.cu.
 #include "../moe/tm_moe_kernels.cuh"
 #include "../lin_attn_tm/tm_linattn_kernels.cuh"
+#include "../lin_attn_tm/gdn_kernels.cuh"          // MF-M3 gated DeltaNet
+#include "../mamba2/selective_scan_kernels.cuh"    // MF-M3 varlen selective scan
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
@@ -165,7 +167,63 @@ static torch::Tensor py_cmplx_matmul(torch::Tensor A, torch::Tensor B) {
     return D;
 }
 
+// ---- MF-M3 gated DeltaNet (varlen, paged state) ----
+static torch::Tensor py_gdn_linear_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+        torch::Tensor g, torch::Tensor beta, torch::Tensor state_pool, torch::Tensor cu_seqlens,
+        torch::Tensor slot_mapping, int64_t Hk, int64_t Hv, int64_t Dk, int64_t Dv) {
+    WCK(q); WCK(k); WCK(v); WCK(g); WCK(beta); WCK(state_pool); WCK(cu_seqlens); WCK(slot_mapping);
+    const int T = q.size(0);
+    const int R = cu_seqlens.numel() - 1;
+    auto y = torch::empty({T, int(Hv), int(Dv)}, v.options());
+    dim3 grid(unsigned(Dv), 1, unsigned(R * Hv));
+    DISPATCH_W6(q, tmgdn::gdn_linear_attention<scalar_t><<<grid, 32, 0, wstream()>>>(
+        wcp<scalar_t>(q), wcp<scalar_t>(k), wcp<scalar_t>(v), wcp<scalar_t>(g), wcp<scalar_t>(beta),
+        wmp<scalar_t>(state_pool), cu_seqlens.data_ptr<int>(), slot_mapping.data_ptr<int>(),
+        wmp<scalar_t>(y), R, int(Hk), int(Hv), int(Dk), int(Dv)););
+    return y;
+}
+
+// ---- MF-M3 varlen Mamba-1 selective scan (paged state) ----
+static torch::Tensor py_selective_scan_varlen(torch::Tensor u, torch::Tensor delta,
+        torch::Tensor A, torch::Tensor B, torch::Tensor C, c10::optional<torch::Tensor> D,
+        c10::optional<torch::Tensor> delta_bias, c10::optional<torch::Tensor> z,
+        torch::Tensor query_start_loc, c10::optional<torch::Tensor> cache_indices,
+        c10::optional<torch::Tensor> has_initial_state, torch::Tensor state,
+        int64_t dstate, int64_t n_groups, bool delta_softplus, int64_t null_block_id) {
+    WCK(u); WCK(delta); WCK(A); WCK(B); WCK(C); WCK(query_start_loc); WCK(state);
+    const int dim = u.size(0), total_tokens = u.size(1);
+    const int batch = query_start_loc.numel() - 1;
+    auto out = torch::empty_like(u);
+    const int P = ((int(dstate) + 31) / 32) * 32;
+    const int shmem = ((P + 31) / 32) * sizeof(float);
+    const float* Dp = D ? D->data_ptr<float>() : nullptr;
+    const float* dbp = delta_bias ? delta_bias->data_ptr<float>() : nullptr;
+    const int* cip = cache_indices ? cache_indices->data_ptr<int>() : nullptr;
+    const uint8_t* hip = has_initial_state ? has_initial_state->data_ptr<uint8_t>() : nullptr;
+    dim3 grid(dim, batch);
+    DISPATCH_W6(u, {
+        const scalar_t* zp = z ? wcp<scalar_t>(*z) : nullptr;
+        tmss::selective_scan_fwd_varlen<scalar_t><<<grid, P, shmem, wstream()>>>(
+            wcp<scalar_t>(u), wcp<scalar_t>(delta), A.data_ptr<float>(), wcp<scalar_t>(B),
+            wcp<scalar_t>(C), Dp, dbp, zp, query_start_loc.data_ptr<int>(), cip, hip,
+            wmp<scalar_t>(out), state.data_ptr<float>(), batch, dim, total_tokens, int(dstate),
+            int(n_groups), D ? 1 : 0, delta_bias ? 1 : 0, z ? 1 : 0, delta_softplus ? 1 : 0,
+            cache_indices ? 1 : 0, has_initial_state ? 1 : 0, int(null_block_id));
+    });
+    return out;
+}
+
 void init_w6(py::module_& m) {
+    m.def("selective_scan_varlen", &py_selective_scan_varlen, py::arg("u"), py::arg("delta"),
+          py::arg("A"), py::arg("B"), py::arg("C"), py::arg("D") = py::none(),
+          py::arg("delta_bias") = py::none(), py::arg("z") = py::none(),
+          py::arg("query_start_loc"), py::arg("cache_indices") = py::none(),
+          py::arg("has_initial_state") = py::none(), py::arg("state"), py::arg("dstate"),
+          py::arg("n_groups"), py::arg("delta_softplus") = true, py::arg("null_block_id") = -1);
+    m.def("gdn_linear_attention", &py_gdn_linear_attention, py::arg("q"), py::arg("k"),
+          py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("state_pool"),
+          py::arg("cu_seqlens"), py::arg("slot_mapping"), py::arg("Hk"), py::arg("Hv"),
+          py::arg("Dk"), py::arg("Dv"));
     m.def("moe_route_topk", &py_moe_route_topk, py::arg("logits"), py::arg("K"));
     m.def("moe_align", &py_moe_align, py::arg("topk_ids"), py::arg("E"),
           "-> (offsets, sorted_row_idx, inv_idx, off_pad, expert_of_tile, gather_idx, inv_pad)");

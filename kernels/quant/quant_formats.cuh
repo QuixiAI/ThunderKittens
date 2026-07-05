@@ -72,6 +72,79 @@ __device__ __forceinline__ float half_at(const uint8_t* p, int idx = 0) {
     return __half2float(reinterpret_cast<const __half*>(p)[idx]);
 }
 
+// ---- MetalForge-parity encoders (inverses of the decoders above) ----
+// float -> fp4 e2m1 nibble. Midpoint thresholds on the {0,.5,1,1.5,2,3,4,6}
+// codebook (MetalForge float_to_fp4_e2m1): boundaries at .25 .75 1.25 1.75
+// 2.5 3.5 5.0, clamp |x| to 6, sign in bit 3. Bit-exact with e2m1_decode.
+__host__ __device__ __forceinline__ uint8_t e2m1_encode(float value) {
+    const float x = fminf(fabsf(value), 6.0f);
+    uint8_t code;
+    if      (x <= 0.25f) code = 0x0;
+    else if (x <  0.75f) code = 0x1;
+    else if (x <= 1.25f) code = 0x2;
+    else if (x <  1.75f) code = 0x3;
+    else if (x <= 2.5f)  code = 0x4;
+    else if (x <  3.5f)  code = 0x5;
+    else if (x <= 5.0f)  code = 0x6;
+    else                 code = 0x7;
+    return uint8_t((value < 0.0f ? 0x8 : 0x0) | code);
+}
+// float -> fp8 e4m3 code, RNE, clamp +-448 (0x7E). Bit-exact with e4m3_decode
+// and with quant_rt.cu / mla's local copies (consolidated here, host+device).
+__host__ __device__ __forceinline__ uint8_t e4m3_encode(float x) {
+    const unsigned sign = (x < 0.0f) ? 0x80u : 0x00u;
+    float a = fabsf(x);
+    if (!(a < 448.0f)) return uint8_t(sign | 0x7Eu);
+    if (a < 0.0009765625f) return uint8_t(sign | unsigned(int(rintf(a * 512.0f))));
+    int e; frexpf(a, &e);
+    const int E = e - 1;
+    if (E < -6) {
+        int mant = int(rintf(a * 512.0f));
+        if (mant >= 8) return uint8_t(sign | (1u << 3));
+        return uint8_t(sign | unsigned(mant));
+    }
+    const float two_m = a / exp2f(float(E));
+    int mant = int(rintf((two_m - 1.0f) * 8.0f));
+    int exp = E + 7;
+    if (mant >= 8) { mant = 0; exp += 1; }
+    if (exp > 15 || (exp == 15 && mant > 6)) return uint8_t(sign | 0x7Eu);
+    return uint8_t(sign | (unsigned(exp) << 3) | unsigned(mant));
+}
+// Host-callable e4m3 decode (no device intrinsics) — same values as e4m3_decode.
+__host__ __forceinline__ float e4m3_decode_host(uint8_t v) {
+    float mag;
+    if (v & 0x78) { int e = (v >> 3) & 0xF, m = v & 7; mag = ldexpf(1.0f + m / 8.0f, e - 7); }
+    else mag = float(v & 7) * 0.001953125f;
+    return (v & 0x80) ? -mag : mag;
+}
+
+// float -> UE8M0 byte = the fp32 exponent field of max(value,0) (MetalForge
+// float_to_ue8m0: raw exponent extraction, NOT round-to-nearest). Exact
+// inverse of e8m0_decode for the powers of two it produces.
+__host__ __device__ __forceinline__ uint8_t e8m0_encode(float value) {
+    const float v = fmaxf(value, 0.0f);
+    uint32_t bits;
+    #ifdef __CUDA_ARCH__
+    bits = __float_as_uint(v);
+    #else
+    memcpy(&bits, &v, 4);
+    #endif
+    return uint8_t((bits >> 23) & 0xFFu);
+}
+
+// ---- NVFP4 scale-factor swizzle (MetalForge nvfp4_quant_swizzled_sf_offset):
+// 128-row x 4-group interleave. row in [0,N), group = k/16. Returns the byte
+// offset into the per-expert swizzled scale buffer. ----
+__host__ __device__ __forceinline__ long nvfp4_sf_offset(int row, int group, int num_k_tiles) {
+    const int m_tile  = row >> 7;
+    const int outer_m = row & 31;
+    const int inner_m = (row >> 5) & 3;
+    const int k_tile  = group >> 2;
+    const int inner_k = group & 3;
+    return ((long(m_tile) * num_k_tiles + k_tile) << 9)
+         | long((outer_m << 4) | (inner_m << 2) | inner_k);
+}
+
 // ---- integer dot primitive: on Ampere this is NATIVE dp4a (Metal needed a software loop) --------
 __device__ __forceinline__ int idot4(unsigned a, unsigned b, int acc = 0) {
     return __dp4a(int(a), int(b), acc);   // signed int8 x4 dot, matching TM's idot4 semantics

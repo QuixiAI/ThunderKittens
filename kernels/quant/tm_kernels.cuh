@@ -105,6 +105,59 @@ __global__ void qgemm(float* Y, const half* X, const uint8_t* Wq, int M, int N, 
     }
 }
 
+// ---- qgemm_ksplit (perf pass): the warp-per-16x16-tile qgemm starves the
+// GPU at decode shapes — M=64, N=512 is only 128 warps across 82 SMs (half
+// the chip idle, no latency hiding). Split the K axis across blockIdx.z:
+// each warp reduces its [k_beg, k_end) slice and atomicAdd's the fp32
+// partial into Y (zeroed by the host). Same fragment math as qgemm. ----
+template<typename FMT>
+__global__ void qgemm_ksplit(float* Y, const half* X, const uint8_t* Wq,
+                             int M, int N, int K, int k_chunk) {
+    const int n0 = blockIdx.x * 16;
+    const int m0 = blockIdx.y * 16;
+    const int k_beg = blockIdx.z * k_chunk;
+    const int k_end = min(K, k_beg + k_chunk);
+    const int bpr = K / FMT::block_k;
+
+    float acc0[4] = {0, 0, 0, 0};
+    float acc1[4] = {0, 0, 0, 0};
+    for (int k0 = k_beg; k0 < k_end; k0 += 16) {
+        half2 a[4], b[4];
+        load_xfrag(a, X, K, m0, k0);
+        load_wfrag<FMT>(b, Wq, bpr, n0, k0);
+        half2 b0[2] = {b[0], b[2]};
+        half2 b1[2] = {b[1], b[3]};
+        mma16816(acc0, a, b0);
+        mma16816(acc1, a, b1);
+    }
+    const int lane = threadIdx.x & 31;
+    const int r = m0 + lane / 4, c0 = n0 + (lane % 4) * 2;
+    if (r < M) {
+        atomicAdd(&Y[size_t(r) * N + c0],         acc0[0]);
+        atomicAdd(&Y[size_t(r) * N + c0 + 1],     acc0[1]);
+        atomicAdd(&Y[size_t(r) * N + c0 + 8],     acc1[0]);
+        atomicAdd(&Y[size_t(r) * N + c0 + 8 + 1], acc1[1]);
+    }
+    if (r + 8 < M) {
+        atomicAdd(&Y[size_t(r + 8) * N + c0],         acc0[2]);
+        atomicAdd(&Y[size_t(r + 8) * N + c0 + 1],     acc0[3]);
+        atomicAdd(&Y[size_t(r + 8) * N + c0 + 8],     acc1[2]);
+        atomicAdd(&Y[size_t(r + 8) * N + c0 + 8 + 1], acc1[3]);
+    }
+}
+
+// Host-side split heuristic: enough K-slices to keep ~2 resident warps per
+// SM slot busy, aligned to the format block so a slice never splits a block.
+static inline int qgemm_pick_kchunk(int M, int N, int K, int block_k) {
+    const long tiles = long((N + 15) / 16) * ((M + 15) / 16);
+    const int target = 1664;                      // ~82 SMs x 20 warps
+    int splits = int((target + tiles - 1) / tiles);
+    const int align = (block_k > 16) ? block_k : 16;
+    int chunk = ((K / (splits > 0 ? splits : 1)) + align - 1) / align * align;
+    if (chunk < align) chunk = align;
+    return chunk;
+}
+
 // full-dequant kernel (route for 256-superblock formats)
 template<typename FMT>
 __global__ void dequant_to_fp16(half* out, const uint8_t* Wq, int N, int K) {
@@ -324,30 +377,7 @@ __global__ void qgemv_w2a8(half* D, const uint8_t* Wq, const int8_t* Xq,
 
 
 
-// float -> e4m3 code, round-to-nearest-even, clamp to +-448 (0x7E). Software, exact.
-__device__ __forceinline__ uint8_t e4m3_encode(float x) {
-    const unsigned sign = (x < 0.0f) ? 0x80u : 0x00u;
-    float a = fabsf(x);
-    if (!(a < 448.0f)) return uint8_t(sign | 0x7Eu);       // clamp (also catches NaN)
-    if (a < 0.0009765625f) {                               // < 2^-10: rounds to 0 or smallest sub
-        int mant = int(rintf(a * 512.0f));                 // a / 2^-9
-        return uint8_t(sign | unsigned(mant));             // 0 or 1
-    }
-    int e;
-    frexpf(a, &e);
-    int E = e - 1;                                          // a in [2^E, 2^(E+1))
-    if (E < -6) {                                           // subnormal range
-        int mant = int(rintf(a * 512.0f));
-        if (mant >= 8) return uint8_t(sign | (1u << 3));    // promote to smallest normal
-        return uint8_t(sign | unsigned(mant));
-    }
-    float two_m = a / exp2f(float(E));                      // [1,2)
-    int mant = int(rintf((two_m - 1.0f) * 8.0f));
-    int exp = E + 7;
-    if (mant >= 8) { mant = 0; exp += 1; }
-    if (exp > 15 || (exp == 15 && mant > 6)) return uint8_t(sign | 0x7Eu);
-    return uint8_t(sign | (unsigned(exp) << 3) | unsigned(mant));
-}
+// e4m3_encode is now the consolidated __host__ __device__ one in quant_formats.cuh.
 // float -> symmetric int8 [-127,127], RNE (matches np.rint).
 __device__ __forceinline__ int8_t int8_encode(float x) {
     float r = rintf(x);
