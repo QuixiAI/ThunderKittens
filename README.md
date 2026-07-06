@@ -243,4 +243,4 @@ Papers: [Single GPU](https://arxiv.org/abs/2410.20399) ·
 
 ## License
 
-MIT, same as upstream.
+MIT. See [`LICENSE`](LICENSE).
