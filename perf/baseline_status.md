@@ -1,7 +1,9 @@
-# ThunderKittens Kernel Baseline Status
+# QuixiCore CUDA Baseline Status
 
-Running notebook for the performance-baseline effort. Method and harness are
-described in `perf/perf.md`. Raw results live under `perf/results/` (git-ignored).
+Baseline snapshots for CUDA kernel performance work. Method and harness are
+described in `perf/perf.md`; ongoing optimization decisions live in
+`perf/optimization_status.md`. Raw results live under `perf/results/`
+(git-ignored).
 
 ## Environment (all numbers below)
 

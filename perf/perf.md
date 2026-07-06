@@ -1,10 +1,9 @@
-# ThunderKittens (Ampere Edition) Performance Handbook
+# QuixiCore CUDA Performance Handbook
 
-This is the operating guide for baselining and optimizing every kernel under
-`kernels/` on NVIDIA Ampere (SM 8.6, RTX 3090). It mirrors the discipline of the
-ThunderMittens Metal handbook (`~/ThunderMittens/perf/perf.md`) but is CUDA- and
-Ampere-specific and reflects the **current** state of the repo, not the
-compile-only baseline it started from.
+This is the operating guide for baselining and optimizing QuixiCore CUDA
+kernels. It mirrors the hardware-independent discipline of the QuixiCore Metal
+handbook while keeping the backend notes specific to NVIDIA CUDA and the current
+Ampere validation host.
 
 The goal is not to collect tricks. Run a disciplined loop: find references, form
 a bottleneck hypothesis, measure a clean baseline, run controlled experiments,
@@ -37,7 +36,7 @@ Attack a specific, named bottleneck:
 - **Sync/smem-bound**: remove needless `__syncthreads`, cut smem traffic and bank
   conflicts, prefer warp-shuffle reductions when cross-warp sharing does not pay.
 
-**The Ampere baseline assumption (mirror of TM's "don't blindly port H100"):**
+**The Ampere baseline assumption:**
 this hardware is SM86. It has **no `tma::`/tensor-maps and no warpgroup MMA**
 (both SM90+), and **no fp8/fp4/mxfp tensor units** (SM89/Blackwell). So:
 
@@ -72,11 +71,11 @@ Rooflines for judging results on one 3090:
 
 **IMPORTANT — this is no longer a compile-only host.** The original handbook said
 "only `layernorm` and cuBLAS baselines execute." That is dead. The full
-ThunderMittens port and the MetalForge parity waves are **SM86-native and
+QuixiCore CUDA port and the MetalForge parity work are **SM86-native and
 validated on these 3090s**: 30 quant formats bit-exact; qgemv/qgemm/qflux/
 lm_head; the serving stack (paged v1/v2, MLA, rope_kv, attn_q, varlen, beam,
 spec); the elementwise/norm/training family; MoE; linear attention; and the
-MetalForge waves (quantized-MoE GEMMs, norm/activation quant, GDN, varlen Mamba
+MetalForge ports (quantized-MoE GEMMs, norm/activation quant, GDN, varlen Mamba
 scan, the sampler zoo, EAGLE). `tk_cuda` pytest is green end to end. **Only the
 SM90+/Blackwell-native kernels** (`mha_h100*`, `bf16_b300*`, TMA/wgmma demos)
 remain build-only here; they need an H100/B200/B300 host.
@@ -152,8 +151,8 @@ so `cpp_extension` refuses — build the `.so` directly with `nvcc` (command in
 standalone kernel has a **self-contained fp64/oracle harness with the build
 command in its header comment** (e.g. `kernels/quant/qgemm.cu`,
 `kernels/moe_quant/moe_quant_test.cu`, `kernels/serving/logits_proc_test.cu`).
-Golden data via `kernels/quant/gen_golden*.py` (imports `~/ThunderMittens`
-`quant.py`). The end-to-end gate:
+Golden data via `kernels/quant/gen_golden*.py` (imports the Metal `quant.py`
+reference when available). The end-to-end gate:
 
 ```bash
 cd kernels/tm_cuda
@@ -165,12 +164,12 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m pytest \
 
 ## Reference Search Protocol
 
-For each kernel, find reference implementations under `.reference/` and record the
-exact files in `perf/optimization_status.md`. Roots present: `vllm`,
+For each kernel, find reference implementations under `.reference/` and record
+the exact files in `perf/optimization_status.md`. Roots present: `vllm`,
 `flashinfer`, `TensorRT-LLM`, `onnxruntime`, `.reference/vllm/.../marlin/`
-(dequant tricks), plus `~/ThunderMittens` (Metal originals + `quant.py`) and
-`.reference/metal-forge/` (the MetalForge serving kernels being ported). Re-clone
-CUTLASS/CUB or the original ThunderKittens CUDA if a kernel needs them.
+(dequant tricks), sibling QuixiCore Metal sources for operation behavior and
+`quant.py`, and `.reference/metal-forge/` for serving kernels being ported.
+Re-clone CUTLASS/CUB or the original CUDA upstream if a kernel needs them.
 
 Bucket every reference idea into: **portable algorithm** (consider), **SM90+/
 Blackwell mechanism** (translate only if SM86 has a real analogue — usually
@@ -291,10 +290,12 @@ tile-ragged, real-model, and stress shapes; log skips with a reason.
 ## Per-Kernel Optimization Loop
 
 1. **Inventory** — entry points, dtypes, shape contract, tests, existing bench.
-2. **References** — `.reference/`, marlin/vllm/cutlass, TM/MetalForge originals.
+2. **References** — `.reference/`, marlin/vllm/cutlass, QuixiCore Metal, and
+   MetalForge originals.
 3. **Baseline** — correctness first (pytest + standalone harness), then the
    harness on the shape set vs the three baselines (framework, naive-decomposed,
-   current-TK). Raw output under `perf/results/`, summary into the notebook.
+   current CUDA implementation). Raw output under `perf/results/`, summary into
+   the notebook.
 4. **Classify** — bytes, FLOPs, achieved vs roofline, occupancy from ptxas
    regs/smem + `ncu`, variance.
 5. **Experiments** — one factor at a time (below). Hypothesis before edit.
@@ -422,7 +423,8 @@ Each kernel section in `perf/optimization_status.md`:
 - Current best impl + current public route (e.g. "qgemm M≥64 → cuBLAS-on-dequant").
 - References inspected (exact files).
 - Correctness command + last result.
-- Baseline table (framework / naive / current-TK on the shape set).
+- Baseline table (framework / naive / current CUDA implementation on the shape
+  set).
 - Experiment table (one factor per row, before/after, keep/reject + why).
 - Decision log + open questions.
 
@@ -455,6 +457,5 @@ For `include/` substrate changes, also run the broader unit tests and the
   tricks, mma fragment layouts, ring pipelines, grouped/MoE GEMM.
 - **Nsight Compute / Systems** docs — occupancy, memory-throughput, stall-reason,
   and roofline sections.
-- The two companions in this repo: `~/ThunderMittens/perf/perf.md` (the Metal
-  handbook this mirrors) and `thundermittens_ampere_port.md` /
-  `metalforge_gap_analysis.md` (what exists and what's measured).
+- The companion docs in this repo: `thundermittens_ampere_port.md` and
+  `metalforge_gap_analysis.md` for historical port notes and measured gaps.

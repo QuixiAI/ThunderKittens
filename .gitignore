@@ -18,7 +18,8 @@ tests/unit_tests
 tests/build
 
 # perf harness output
-perf/results/
+perf/results/*
+!perf/results/.gitignore
 
 # local reference checkouts (vllm, driver source trees)
 .reference/
