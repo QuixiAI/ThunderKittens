@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Backend: QuixiCore CUDA"
+echo "Kernel manifest: .quixicore/kernels.yaml"
+echo "Quant manifest: .quixicore/quant-formats.yaml"
+echo
+sed -n '/^families:/,$p' .quixicore/kernels.yaml

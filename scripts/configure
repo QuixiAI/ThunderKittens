@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "QuixiCore CUDA uses per-kernel Makefiles and PyTorch extension builds."
+if command -v nvcc >/dev/null 2>&1; then
+  nvcc --version | sed -n '1,4p'
+else
+  echo "nvcc was not found on PATH."
+fi

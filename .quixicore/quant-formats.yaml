@@ -1,0 +1,28 @@
+schema_version: 0.1
+backend: cuda
+formats:
+  gguf:
+    status: implemented
+    notes: q8_0, q4_0, q4_1, q5_0, q5_1, q2_K, q3_K, q4_K, q5_K, q6_K, and i-quant families.
+  mx:
+    status: implemented
+    notes: MXFP8, MXFP6, MXFP4-style formats implemented in software on CUDA targets.
+  fp8:
+    status: implemented
+    notes: e4m3, e5m2, block fp8, fp8 GEMM, fp8 cache paths, and fp8 MoE paths.
+  fp4:
+    status: implemented
+    notes: fp4/nvfp4-style software dequant and GEMM paths.
+  bitnet:
+    status: implemented
+    notes: BitNet ternary weight paths.
+  marlin_awq_gptq_hqq:
+    status: implemented
+    notes: Weight-only quantized GEMV/GEMM and act-order/block-scale variants.
+status_values:
+  - implemented
+  - partial
+  - experimental
+  - planned
+  - unsupported
+notes: Format details should be expanded into operation-level coverage as the manifests become stricter.

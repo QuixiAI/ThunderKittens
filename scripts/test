@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="${1:-help}"
+if [ $# -gt 0 ]; then
+  shift
+fi
+
+case "${target}" in
+  help)
+    echo "Usage: scripts/test <target>"
+    echo "Targets: tm_cuda, tests"
+    ;;
+  tm_cuda)
+    cd kernels/tm_cuda
+    python3 -m pytest test_tk_cuda.py "$@"
+    ;;
+  tests)
+    make -C tests "$@"
+    ;;
+  *)
+    echo "Unknown test target: ${target}" >&2
+    exit 2
+    ;;
+esac

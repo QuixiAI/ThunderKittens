@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="${1:-help}"
+if [ $# -gt 0 ]; then
+  shift
+fi
+
+case "${target}" in
+  help)
+    echo "Usage: scripts/build <target>"
+    echo "Targets:"
+    echo "  tm_cuda          Build the tk_cuda PyTorch extension"
+    echo "  tests            Build primitive tests"
+    echo "  <path>           Run make in a kernel directory, for example kernels/gemm/bf16_h100"
+    ;;
+  tm_cuda)
+    cd kernels/tm_cuda
+    python3 setup.py build_ext --inplace "$@"
+    ;;
+  tests)
+    make -C tests "$@"
+    ;;
+  *)
+    if [ -d "${target}" ]; then
+      make -C "${target}" "$@"
+    elif [ -d "kernels/${target}" ]; then
+      make -C "kernels/${target}" "$@"
+    else
+      echo "Unknown build target: ${target}" >&2
+      exit 2
+    fi
+    ;;
+esac

@@ -1,0 +1,17 @@
+backend: cuda
+name: QuixiCore CUDA
+repo: QuixiAI/QuixiCore-CUDA
+umbrella: QuixiAI/QuixiCore
+contract: v0.1
+status: active
+targets:
+  - sm80
+  - sm86
+  - sm89
+  - sm90
+  - sm100
+upstream: HazyResearch/ThunderKittens
+integrations:
+  - CUDA
+  - PyTorch
+notes: Native NVIDIA CUDA backend for Ampere and newer GPUs. Current source layout is migrating toward the shared QuixiCore family/operation taxonomy.

@@ -8,6 +8,30 @@ It implements the contract defined by [QuixiAI/QuixiCore](https://github.com/Qui
 
 **Native implementations. Shared contract. No shared code.**
 
+## QuixiCore Standard Files
+
+- Contract metadata: [`.quixicore/backend.yaml`](.quixicore/backend.yaml)
+- Kernel coverage manifest: [`.quixicore/kernels.yaml`](.quixicore/kernels.yaml)
+- Quant format manifest: [`.quixicore/quant-formats.yaml`](.quixicore/quant-formats.yaml)
+- Repository structure: [`docs/repository-structure.md`](docs/repository-structure.md)
+- Contribution workflow: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- Security policy: [`SECURITY.md`](SECURITY.md)
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md)
+
+Common developer entrypoints:
+
+```bash
+scripts/configure
+scripts/build
+scripts/test
+scripts/bench
+scripts/coverage-report
+scripts/clean
+```
+
+These scripts keep the QuixiCore workflow consistent while wrapping CUDA-native
+Makefiles, CUDA extension builds, and benchmark tools.
+
 <div align="center" >
     <img src="assets/thunderkittens.png" height=350 alt="QuixiCore CUDA logo" style="margin-bottom:px"/><br/>
     <em>Native NVIDIA CUDA kernels for Ampere and newer GPUs.</em><br/><br/>

@@ -1,0 +1,76 @@
+schema_version: 0.1
+backend: cuda
+status_values:
+  - implemented
+  - partial
+  - experimental
+  - planned
+  - unsupported
+  - capability_gated
+layout: legacy_migration
+families:
+  norms:
+    status: implemented
+    paths:
+      - kernels/elementwise
+      - kernels/layernorm
+  activations:
+    status: implemented
+    paths:
+      - kernels/elementwise
+  attention:
+    status: implemented
+    paths:
+      - kernels/attention
+      - kernels/serving
+      - kernels/rotary
+  linear_attention:
+    status: implemented
+    paths:
+      - kernels/based
+      - kernels/hedgehog
+      - kernels/lin_attn_tm
+      - kernels/linear_attention
+  ssm:
+    status: implemented
+    paths:
+      - kernels/mamba2
+      - kernels/fftconv
+  matmul:
+    status: implemented
+    paths:
+      - kernels/gemm
+      - kernels/flux
+  quantization:
+    status: implemented
+    paths:
+      - kernels/quant
+      - kernels/moe_quant
+  moe:
+    status: implemented
+    paths:
+      - kernels/moe
+      - kernels/moe_quant
+  sampling:
+    status: implemented
+    paths:
+      - kernels/serving
+  serving:
+    status: implemented
+    paths:
+      - kernels/serving
+  optimizers:
+    status: implemented
+    paths:
+      - kernels/elementwise
+  collectives:
+    status: capability_gated
+    paths:
+      - kernels/parallel
+  utils:
+    status: implemented
+    paths:
+      - kernels/elementwise
+      - kernels/quant
+      - kernels/serving
+notes: Family-level manifest. Operation-level paths should be added as kernels move into the canonical family/operation tree.
