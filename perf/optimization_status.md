@@ -234,3 +234,63 @@ no rope), exactly the source's V task. Templated on `(N_HEAD, N_HEAD_KV, D)`.
   byte-identical-off constraint), exact vs the fp64 oracle at the f16-output floor,
   and ~2x faster than composing separate norm/rope passes because it never
   materializes the f32 intermediate. No env flag: there is no slower variant to gate.
+
+### serving/attn_swa — symmetric (bidirectional) sliding-window attention, banded key-tiling, int8 Q.K^T (head-dim 256, GQA)
+
+New file: `kernels/serving/attn_swa.cu`. Built on the already-ported `attn_q_int8`
+(int8 Q.K^T, per-row amax/127 scale, `CUDA_R_8I -> CUDA_R_32I` score GEMM, fused
+dequant + softmax, fp16 P.V). The delta vs. every existing box attention kernel
+(all causal / non-causal only) is a **symmetric ±window/2 band mask** — the
+EmbeddingGemma alternating-layer *encoder* SWA, so query `q` attends keys
+`[q - window/2, q + window/2]` on **both** sides (NOT causal). Two things ported
+from embeddinggemma.c:
+
+1. the symmetric window mask in `attention_softmax_f16_kernel`
+   (`first = q > hw ? q - hw : 0; last = min(T, q + hw + 1)`), applied inside the
+   softmax so out-of-band keys get probability 0; and
+2. the host banded key-tiling in `tensor_core_attention`
+   (`swa_tensor_tile_tokens` / `swa_tensor_banded_min_tokens`): when the window is
+   set and `T >= banded_min`, queries run in tiles of `swa_tile` and each tile's
+   score/PV GEMMs span only the key band `[tile_start - hw, tile_start + tile_len
+   + hw)`, collapsing the O(T²) matmuls to O(T·(tile + window)). Every query's full
+   band lies inside its tile's key band, so banding changes *work*, not the result.
+   (Key ranges are aligned to 16 for the int8 GEMM leading dim; the mask still
+   confines each query to its exact symmetric band.)
+
+- **Correctness** — fp64 oracle recomputes the symmetric-band softmax
+  (`ei_attention_mha_range`, `src/kernels.c`) from the int8-quantized Q,K and fp16
+  V (head 0); the banded output must match `rel < 0.02`. A self-parity number
+  reports banded vs. the dense (full key range, window masked only in softmax)
+  int8 attention across all heads — it must be identical since banding only skips
+  masked-out keys. Swept over window ∈ {128,256,512} and T ∈ {256,512,1024} with
+  banding **forced on** (tile=256) so the tiling logic is exercised.
+
+  | window | T | banded vs fp64 oracle (rel / max) | banded vs dense | gate |
+  |---|---|---|---|---|
+  | 128 | 256/512/1024 | 0.0245% / 9.6e-04 | 0.0000% | PASS |
+  | 256 | 256/512/1024 | 0.0246% / 8.6e-04 | 0.0000% | PASS |
+  | 512 | 256/512/1024 | 0.0250% / 8.4e-04 | 0.0000% | PASS |
+
+  rel sits at the int8-Q/K quant floor (~0.025%, matching `attn_q_int8`); the
+  symmetric band is preserved (an accidental causal mask would fail the oracle).
+  banded-vs-dense is bit-for-bit 0.0000% — the banding is mathematically exact.
+
+- **Perf A/B (RTX 3090, GPU 1), GQA 3:1, head-dim 256, window=512** — banded
+  key-tiling (tile=1024, `banded_min`=1536) vs. dense int8 attention (full key
+  range, same window mask). int8 Q,K quantized once up front (shared, not part of
+  the attention race).
+
+  | T | banded ms | dense ms | speedup | tiling |
+  |---|---|---|---|---|
+  | 512  | 0.0572 | 0.0572 | 1.00x | none (T < banded_min) |
+  | 1024 | 0.1068 | 0.1067 | 1.00x | none (T < banded_min) |
+  | 2048 | 0.2424 | 0.2946 | 1.22x | banded |
+  | 4096 | 0.5300 | 1.0365 | 1.96x | banded |
+
+- **Decision: KEEP** as the SWA attention path, opt-in gated to long sequences
+  exactly like the source (`swa_tensor_banded_min_tokens`=1536): below the
+  threshold banded == dense (identical work, 1.00x), and the win only materializes
+  once T ≫ window — 1.22x at T=2048, 1.96x at T=4096 — because the band is then a
+  small fraction of the full O(T²) key range. The int8 Q.K^T inherits
+  `attn_q_int8`'s ~0.025% vs-oracle accuracy (P.V stays fp16; int8 P.V rejected
+  upstream, not ported). Recorded in perf/optimization_status.md.
