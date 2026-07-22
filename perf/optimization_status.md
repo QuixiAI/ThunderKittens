@@ -180,3 +180,57 @@ epilogue is intentionally **not** ported (fails parity on GEMM shapes).
   (no byte-identical-off constraint), strictly faster than composing the separate
   RMS/mean/L2 ops, exact vs the fp64 oracle, and matches the checked reference
   math bit-for-bit in structure. No env flag: there is no slower variant to gate.
+
+---
+
+## Wave 10 — fused attention-projection kernels ported from embeddinggemma.c
+
+Two fused CUDA kernels ported as **shape-named** specialized variants, named by
+their tensor shapes (head-dim 256, GQA head-group counts, symmetric window),
+never by model.
+
+### serving/qk_norm_rope — fused per-head QK-RMSNorm + NeoX RoPE + packed-QKV split + f16 cast (head-dim 256, GQA)
+
+New file: `kernels/serving/qk_norm_rope.cu`. Ported from embeddinggemma.c
+(`src/engine_cuda.cu` `qkv_norm_rope_f16_kernel` / `qk_norm_rope_kernel`;
+portable fp64 reference is the CPU `ei_qk_norm_rope_qk_inplace` in
+`src/kernels.c`). One warp owns one `(token, head)` task over the packed
+projection output `combined = [Q: N_HEAD*D][K: N_HEAD_KV*D][V: N_HEAD_KV*D]` (f32).
+For each Q/K head it RMS-normalizes the D=256 head row with the learned per-dim
+norm weight, folds the query logit scale into the reciprocal
+(`inv = rsqrt(ss/D + eps) * scale`, `scale = 0.0625` for Q and `1.0` for K — the
+source applies 0.0625 inside `inv`, i.e. to `x0,x1` before the rotation, identical
+to applying it after because RoPE is a rotation), applies NeoX split-half rotary
+from a precomputed `(cos,sin)` table indexed by the token position, and casts to
+f16 into the split Q/K outputs. Every V head is a plain f32->f16 copy (no norm,
+no rope), exactly the source's V task. Templated on `(N_HEAD, N_HEAD_KV, D)`.
+
+- **Correctness** — fp64 oracle recomputes the reference norm->rope->cast math in
+  double precision from the same inputs (scale folded into `inv`, matching the
+  kernel; `cos/sin` in double). Swept over sequence lengths `T in {1,7,37,128,512,
+  2048}`, both rope bases (swa `1e4` / full `1e6`), and three GQA head-group counts.
+  f16 output, so the gate is `rel = sum|got-ref|/sum|ref| < 0.02`, `cosine > 0.999`.
+
+  | GQA (N_HEAD:N_HEAD_KV) | rel | max abs | cosine | gate |
+  |---|---|---|---|---|
+  | 3:1 | 0.01762% | 1.95e-03 | 0.99999998 | PASS |
+  | 4:2 | 0.01762% | 1.95e-03 | 0.99999998 | PASS |
+  | 8:2 | 0.01761% | 1.95e-03 | 0.99999998 | PASS |
+
+  (rel is at the f16-output floor; the 3:1 row is the EmbeddingGemma reference shape.)
+
+- **Perf A/B (RTX 3090, GPU 1)** — fused single-pass kernel vs the naive composed
+  baseline (stage 1: split + RMSNorm each head into an f32 `[tokens][*]` temp in
+  global memory + cast V; stage 2: rope + f16-cast Q/K from the temp). The fused
+  version keeps the normalized head row in registers, avoiding the temp round-trip.
+
+  | GQA | T | fused ms | naive ms | speedup |
+  |---|---|---|---|---|
+  | 3:1 | 2048 | 0.0248 | 0.0489 | 1.97x |
+  | 4:2 | 2048 | 0.0371 | 0.0715 | 1.93x |
+  | 8:2 | 2048 | 0.0536 | 0.1113 | 2.08x |
+
+- **Decision: KEEP** as the default (and only) QK-norm+rope path — a new op (no
+  byte-identical-off constraint), exact vs the fp64 oracle at the f16-output floor,
+  and ~2x faster than composing separate norm/rope passes because it never
+  materializes the f32 intermediate. No env flag: there is no slower variant to gate.
