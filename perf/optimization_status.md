@@ -120,3 +120,63 @@ source found it breaks embedding accuracy.
   source, which gates int8 attention behind a min-tokens threshold (~80-192). The
   ~2% output error vs fp16 is acceptable for embedding pooling (validated
   end-to-end in the source); int8 P.V (mode 2) rejected upstream, not ported.
+
+---
+
+## Wave 9 — embedding pooling head ported from embeddinggemma.c
+
+fp32 sentence-embedding pooling head from `embeddinggemma.c` (`src/engine_cuda.cu`
+`pool_kernel`), ported as a **shape-named** specialized variant. Named by the
+D-vector shape, never by model.
+
+### serving/pool_mean_rms_l2 — masked mean-pool -> per-token RMSNorm -> L2 (D in {256,512,768,1024})
+
+New file: `kernels/serving/pool_mean_rms_l2.cu`. One warp owns a whole sequence's
+D-vector (lane `l` owns dims l, l+32, ..., D/32 registers per lane). For each
+valid token in the sequence's `[offsets[s], offsets[s+1])` range it RMS-normalizes
+the token row with the learned weight (`inv = rsqrt(sum_d row[d]^2 / D + eps)`,
+accumulate `row[d]*w[d]*inv`), then after the token loop mean-pools by
+`1/(stop-start)` and L2-normalizes the pooled vector (unit-scale guard on the
+all-zero case). Weights are applied as plain `w` — the +1 Gemma fold is baked into
+the exported norm weights offline, so both reference kernels use `x*scale*w`, no
+`(1+w)` here. Templated on D and dispatched at runtime; D must be a multiple of 32.
+Only the plain mean->RMS->L2 head is ported; the source's fused-singleton-pool
+epilogue is intentionally **not** ported (fails parity on GEMM shapes).
+
+- **Correctness** — fp64 oracle recomputes the CPU reference `ei_mean_pool_rms_l2`
+  (`src/kernels.c`) in double precision from the same inputs; the fp32 kernel must
+  match `rel = sum|got-ref|/sum|ref| < 0.02` (pure fp32, so it lands far tighter)
+  with cosine ~1. Swept over one packed batch with n_tokens in {1,4,7,37,128,512}
+  (covers the singleton and long-sequence cases).
+
+  | D | rel | max abs | cosine | gate |
+  |---|---|---|---|---|
+  | 256  | 0.000015% | 1.0e-07 | 1.00000000 | PASS |
+  | 512  | 0.000015% | 9.5e-08 | 1.00000000 | PASS |
+  | 768  | 0.000014% | 8.2e-08 | 1.00000000 | PASS |
+  | 1024 | 0.000015% | 8.2e-08 | 1.00000000 | PASS |
+
+- **Perf A/B (RTX 3090, GPU 1)** — fused single-pass kernel vs the naive composed
+  baseline (stage 1: RMS-normalize every token row into a `[total_tokens][D]` temp
+  in global memory; stage 2: mean + L2 over the temp). The fused version keeps the
+  normalized rows in registers, so it avoids the full temp-matrix round-trip.
+
+  | shape (B seqs x T tok) | D | fused ms | naive ms | speedup |
+  |---|---|---|---|---|
+  | 1024 x 64  | 256  | 0.0837 | 0.2701 | 3.23x |
+  | 1024 x 64  | 512  | 0.1831 | 0.5702 | 3.12x |
+  | 1024 x 64  | 768  | 0.3720 | 0.9924 | 2.67x |
+  | 1024 x 64  | 1024 | 0.4510 | 1.2466 | 2.76x |
+  | 256 x 256  | 768  | 0.6716 | 1.1093 | 1.65x |
+  | 4096 x 16  | 768  | 0.4745 | 0.9521 | 2.01x |
+
+  Fused reaches ~800 GB/s at D=256 (bandwidth-bound, as expected for a pooling
+  reduction); the naive baseline pays 2-3x for materializing the normalized token
+  matrix. Speedup shrinks toward 1.3-1.7x only for very long per-sequence token
+  counts (T=256), where the stage-1 temp write is better amortized, but the fused
+  path still wins in every cell.
+
+- **Decision: KEEP** as the default (and only) pooling-head path — it is a new op
+  (no byte-identical-off constraint), strictly faster than composing the separate
+  RMS/mean/L2 ops, exact vs the fp64 oracle, and matches the checked reference
+  math bit-for-bit in structure. No env flag: there is no slower variant to gate.
