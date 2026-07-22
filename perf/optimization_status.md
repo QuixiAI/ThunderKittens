@@ -82,3 +82,41 @@ no duplication.
   to `qgemm_ksplit`. Follow-up (backlogged): a K-split over `blockIdx.z` with an
   fp32 atomic combine, mirroring `qgemm_ksplit`, to fill the 82 SMs at decode.
 
+### serving/attn_q_int8 — int8 Q.K^T flash score stage, head-dim 256, GQA (mode 1)
+
+New file: `kernels/serving/attn_q_int8.cu`. Distinct from `attn_q` (which
+quantizes K/V *storage* and computes in fp16): this quantizes Q and K to int8
+with a per-row (amax/127) scale, runs S = Q.K^T on the int8 tensor cores
+(cuBLAS `CUDA_R_8I -> CUDA_R_32I`, as the source does), and dequantizes the int32
+partials **inside** the softmax by `qscale[q]*kscale[k]` (no extra query x key
+pass). P.V stays fp16. The two hand-written ported kernels are `quantize_rows_i8`
+(per-row int8 quant, D=256) and `attention_softmax_i8` (fused dequant + row
+softmax). The source's int8 P.V "mode 2" is **intentionally not ported** — the
+source found it breaks embedding accuracy.
+
+- **Correctness** — fp64 oracle recomputes `softmax(qs*ks * Qi8.Ki8^T) . Vf` from
+  the same int8 inputs; kernel output must match `rel < 0.02`. A second number
+  reports the int8-vs-full-fp16 attention-output error (the accuracy the int8 QK
+  path costs — the justification for mode 1 over mode 2).
+
+  | T | vs fp64 oracle (rel / max) | int8 vs fp16 output | gate |
+  |---|---|---|---|
+  | 256  | 0.0255% / 7.8e-04 | 1.96% | PASS |
+  | 512  | 0.0247% / 7.6e-04 | 1.88% | PASS |
+  | 2048 | 0.0253% / 8.7e-04 | 2.11% | PASS |
+
+- **Perf A/B (RTX 3090, GPU 1), GQA 3:1, head-dim 256:**
+
+  | T | QK stage int8 | QK stage fp16 | QK ratio | full attn ratio |
+  |---|---|---|---|---|
+  | 256  | 4.1 TOP/s  | 5.3 TFLOP/s  | 0.77x | 0.89x |
+  | 512  | 16.0 TOP/s | 20.2 TFLOP/s | 0.79x | 0.93x |
+  | 2048 | 58.1 TOP/s | 37.9 TFLOP/s | 1.53x | 1.14x |
+
+- **Decision: KEEP** as an opt-in variant gated to long sequences: the int8 QK^T
+  wins from T >= ~1024 (1.53x on the score GEMM at T=2048) and the full attention
+  from T >= ~2048 (1.14x). At short T the per-row quantize overhead is not
+  amortized and PV/softmax dominate, so it is ~neutral-to-slower — matching the
+  source, which gates int8 attention behind a min-tokens threshold (~80-192). The
+  ~2% output error vs fp16 is acceptable for embedding pooling (validated
+  end-to-end in the source); int8 P.V (mode 2) rejected upstream, not ported.
