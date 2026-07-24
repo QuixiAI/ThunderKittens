@@ -144,27 +144,70 @@ buckets:
 
 ## Operation Layout
 
-Prefer one directory per operation:
+Use one directory per contract operation. The filesystem rule is semantic
+first, target variant second: do not create branch-only, architecture-first, or
+marketing-name-first kernel trees.
 
 ```text
 kernels/<family>/<operation>/
   README.md
-  include/
-  src/
+  common/
+    include/
+    src/
   variants/
     cuda_sm80/
+      include/
+      src/
+      tests/
+      bench/
     cuda_sm90/
+      include/
+      src/
+      tests/
+      bench/
     cuda_sm100/
+      include/
+      src/
+      tests/
+      bench/
   tests/
   bench/
 ```
 
-For small operations, direct source files under the family are acceptable until
-there is more than one implementation.
+`common/` is for target-independent operation code only. Anything that depends
+on a CUDA architecture, PTX instruction selection, Tensor Core shape, memory
+hierarchy assumption, scheduler strategy, or launch geometry belongs under a
+variant directory.
+
+For very small operations, direct source files under the operation directory are
+acceptable only when they are genuinely target-independent. As soon as an
+operation has more than one architecture-specific implementation, move all
+target-specific source into `variants/`.
 
 Architecture names should describe the CUDA target, not the marketing feature
 alone. Prefer `cuda_sm80`, `cuda_sm90`, `cuda_sm100`, or a more specific
 operation variant under those directories.
+
+Branches are not the architecture boundary. A backend repository should keep
+all supported architecture variants in `main` side by side, with build and test
+scripts selecting variants by requested or detected target.
+
+## Target-Specific Internals
+
+Public backend headers remain under `include/quixicore/cuda/`. CUDA primitive
+libraries or low-level implementation headers that differ by architecture should
+use explicit internal target directories, for example:
+
+```text
+include/internal/cuda/
+  common/
+  sm80/
+  sm90/
+  sm100/
+```
+
+Operation variants may include these internal headers, but contract-facing
+headers should not expose target-specific implementation layouts.
 
 ## Tests And Benchmarks
 
@@ -225,6 +268,10 @@ the CUDA, Metal, ROCm, XPU, and Gaudi bindings deliberately.
 - Keep binding code in `bindings/`.
 - Keep CUDA tuning, PTX, cooperative groups, CUTLASS/TK-style implementation
   details, and architecture specialization under operation variants.
+- Keep all supported CUDA architecture variants in the repo; do not depend on
+  one branch per architecture.
+- Build, test, and benchmark entrypoints must filter variants by the selected
+  CUDA target and must not try to compile unrelated architecture variants.
 - Use `collectives/` for multi-GPU CUDA/NCCL extensions; mark them capability
   gated in `.quixicore/kernels.yaml`.
 - If an operation has no meaningful CUDA implementation, mark it unsupported in
